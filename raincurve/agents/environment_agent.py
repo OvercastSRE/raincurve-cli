@@ -1,0 +1,1210 @@
+from __future__ import annotations
+
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Callable
+
+from raincurve.agents.base_agent import AgentResult, BaseAgent, _exec_bash, _truncate
+from raincurve.utils.repo_scanner import build_repo_context
+
+MAX_TOOL_CALLS = 150
+MAX_WALLCLOCK_S = 1800
+
+TOOLS = [
+    {
+        "name": "bash",
+        "description": (
+            "Run a shell command in the project directory. Use for: git, docker, "
+            "npm/pip/cargo install, running build commands, inspecting files, "
+            "starting services, checking health. Returns stdout, stderr, exit_code."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to run"},
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (relative to project root). Defaults to project root.",
+                },
+                "timeout_s": {
+                    "type": "integer",
+                    "description": "Timeout in seconds. Default 120.",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "text_editor",
+        "description": (
+            "View or edit files. Commands: "
+            "view (read a file or line range), "
+            "create (write a new file), "
+            "str_replace (replace exact text in a file)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["view", "create", "str_replace"],
+                },
+                "path": {"type": "string", "description": "File path relative to project root"},
+                "file_text": {"type": "string", "description": "For create: full file content"},
+                "old_str": {"type": "string", "description": "For str_replace: exact text to find"},
+                "new_str": {"type": "string", "description": "For str_replace: replacement text"},
+                "view_range": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "For view: [start_line, end_line]",
+                },
+            },
+            "required": ["command", "path"],
+        },
+    },
+    {
+        "name": "web_fetch",
+        "description": (
+            "Fetch a URL and return its content. Use this to research how to run "
+            "external services locally — e.g., find Docker images, local mock projects, "
+            "setup instructions for services like Supabase, MinIO, localstripe, etc. "
+            "Works with GitHub READMEs, Docker Hub, blog posts, and documentation sites."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch (e.g., a GitHub README, Docker Hub page, or docs page)",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": (
+            "Search the web for information. Use this to find how to mock or run "
+            "external services locally — e.g., 'run supabase locally docker', "
+            "'localstripe stateful stripe mock', 'minio s3 docker setup'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "done",
+        "description": (
+            "Call this when the application is built, running, and ALL verification checks pass. "
+            "You must provide evidence that the database has tables, mock services respond, "
+            "and at least one end-to-end API test passes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "port": {"type": "integer", "description": "The host port the app is accessible on"},
+                "health_path": {"type": "string", "description": "HTTP path to verify health"},
+                "services": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "container_name": {"type": "string"},
+                            "host_port": {"type": "integer"},
+                            "image": {"type": "string"},
+                        },
+                    },
+                    "description": "All Docker containers/services started",
+                },
+                "verification": {
+                    "type": "object",
+                    "description": "Evidence that the system actually works end-to-end",
+                    "properties": {
+                        "db_check": {
+                            "type": "object",
+                            "properties": {
+                                "command": {
+                                    "type": "string",
+                                    "description": "The docker exec command run to check the database",
+                                },
+                                "tables_found": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "success": {"type": "boolean"},
+                            },
+                            "required": ["command", "tables_found", "success"],
+                        },
+                        "mock_checks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "service": {"type": "string"},
+                                    "url_tested": {"type": "string"},
+                                    "status": {"type": "integer"},
+                                    "success": {"type": "boolean"},
+                                },
+                                "required": ["service", "url_tested", "success"],
+                            },
+                            "description": "Result of testing each mock service endpoint",
+                        },
+                        "api_test": {
+                            "type": "object",
+                            "properties": {
+                                "endpoint": {"type": "string"},
+                                "method": {"type": "string"},
+                                "status": {"type": "integer"},
+                                "response_snippet": {
+                                    "type": "string",
+                                    "description": "First 500 chars of response body",
+                                },
+                                "success": {"type": "boolean"},
+                            },
+                            "required": ["endpoint", "method", "success"],
+                        },
+                    },
+                    "required": ["db_check", "mock_checks", "api_test"],
+                },
+                "seed_commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Commands to seed data",
+                },
+                "test_credentials": {
+                    "type": "object",
+                    "description": "Default login credentials if the app has auth",
+                    "properties": {
+                        "username": {"type": "string"},
+                        "password": {"type": "string"},
+                        "login_path": {"type": "string"},
+                        "login_body_template": {"type": "object"},
+                    },
+                },
+                "env_vars_used": {
+                    "type": "object",
+                    "description": "Environment variables set on containers",
+                },
+                "modifications": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Files created or modified",
+                },
+                "notes": {"type": "string"},
+            },
+            "required": ["port", "health_path", "services", "verification"],
+        },
+    },
+]
+
+SYSTEM_PROMPT = """\
+You are a production sandbox builder. Your job is to take a codebase and get it \
+running locally in Docker containers — a high-fidelity production replica with \
+minimal resource footprint.
+
+## Your tools
+
+- `bash`: Run shell commands (docker, git, npm, pip, etc.)
+- `text_editor`: Read and edit files (view, create, str_replace)
+- `web_fetch`: Fetch a URL (GitHub README, Docker Hub, docs) to research solutions
+- `web_search`: Search the web for setup guides, Docker images, mock services
+- `done`: Signal completion with service details for verification
+
+## Approach
+
+1. Read the repo structure and key files (Dockerfile, docker-compose, package.json, \
+   .devcontainer/devcontainer.json, etc.)
+2. Identify ALL external service dependencies (Supabase, Stripe, AWS S3, Firebase, \
+   PostHog, etc.) by scanning env files, imports, and config.
+3. For each external dependency, find the best way to get it working locally. \
+   Use `web_search` and `web_fetch` to research options. You have full autonomy \
+   to decide the best approach for each service — you are the expert.
+4. Prefer EXISTING Dockerfiles and docker-compose files if present. Use them as-is or \
+   with minimal modifications.
+5. If no Dockerfile exists, write one from scratch using multi-stage builds.
+6. BEFORE building, always write a `.dockerignore` if one doesn't exist (see below).
+7. Start all service replacements FIRST (databases, caches, mocked services).
+8. Configure the app's environment to point at these local services.
+9. Build with BuildKit enabled and cache mounts for fast rebuilds.
+10. Run the application container with resource caps.
+11. Run migrations and seed data if applicable.
+12. Verify the app is healthy (curl the health endpoint).
+13. Call `done` with all service details.
+
+## External service replacement (CRITICAL)
+
+When an app depends on external services, you MUST provide functional local \
+replacements — not skip them. The goal is a working production replica.
+
+YOU HAVE FULL PERMISSION TO MODIFY THE APPLICATION SOURCE CODE to make services \
+work locally. This is a sandbox — not production. Do whatever it takes to get the \
+app running. Examples of acceptable code changes:
+- Modify config files to point at local services
+- Edit environment loading code to accept local URLs
+- Add conditional logic to use local auth instead of a third-party provider
+- Swap out SDK client initialization to point at local endpoints
+- Disable SSL/TLS verification for local services
+- Comment out or bypass service health checks that call external APIs
+- Modify middleware to skip external auth validation in dev mode
+- Change import paths or add adapter code for local service replacements
+- Edit docker-compose files, Dockerfiles, or build configs
+- Create wrapper scripts or config patches
+
+Record every file you modify in your `done` call under `modifications`.
+
+### Strategy for each service type
+
+Use your judgment. Here is general guidance:
+
+**Services with official local/mock Docker images** (preferred):
+- Stripe → `stripe/stripe-mock`, Supabase → `supabase/postgres` + GoTrue + PostgREST, \
+  Firebase → official emulator suite, AWS S3 → MinIO, AWS services → LocalStack, \
+  Redis → `redis:7-alpine`, Postgres/MySQL/Mongo → official Docker images.
+- Use `web_search` to find the right image and setup for anything you're unsure about.
+
+**Auth providers** (Clerk, Auth0, Okta, Google OAuth, AWS Cognito):
+- If there's an official mock/emulator, use it.
+- Otherwise, MODIFY THE CODE to bypass the auth provider in dev mode. For example: \
+  create a mock auth middleware that returns a hardcoded user, or swap the auth \
+  client config to point at a generic OAuth mock like `mock-oauth2-server`.
+- The key insight: the sandbox user doesn't need real auth — they need the app to \
+  be functional. A hardcoded dev user is better than a broken auth flow.
+
+**SaaS analytics/monitoring** (PostHog, Sentry, Datadog, LaunchDarkly):
+- Disable via environment variables. Most of these SDKs have a "disable" flag.
+- If not, modify the initialization code to no-op in dev mode.
+
+**Email services** (SendGrid, Resend, Mailgun, SES, Postmark):
+- Use Mailpit (`axllent/mailpit`) — it captures all outgoing email with a web UI.
+- Change the app's SMTP config to point at Mailpit.
+
+**Message brokers** (RabbitMQ, Kafka, SQS):
+- Run the real service in Docker — these all have lightweight official images.
+
+**Search services** (Algolia, Elasticsearch, Meilisearch):
+- Run the real engine in Docker. For Algolia, swap to Meilisearch and modify \
+  the client initialization code.
+
+**Vector databases** (Pinecone, Weaviate, Qdrant):
+- Run the real engine in Docker (all have official images).
+- Modify the client config to point at the local instance.
+
+**Payments** (Stripe, PayPal, Lemon Squeezy):
+- Use official mock servers where available. For others, modify the code to use \
+  test/sandbox mode with dummy credentials.
+
+**General principle**: prefer running real services or official mocks. When that's \
+not possible, MODIFY THE CODE to make it work. A working sandbox with code changes \
+is infinitely better than a broken sandbox with pristine code. Always use Docker \
+network hostnames (e.g., `http://myapp-postgres:5432`) not localhost.
+
+## Wiring external services (CRITICAL — env vars are NOT enough)
+
+For database services (Postgres, Redis, MongoDB), env var wiring works — apps \
+universally read DATABASE_URL/REDIS_URL from environment variables. Set the env \
+var to the Docker network hostname and you're done.
+
+For HTTP API services (Stripe, SendGrid, Twilio, OpenAI, Auth0, etc.), setting \
+env vars like STRIPE_SECRET_KEY=sk_test_fake is NOT sufficient. The SDK client \
+still calls the real API endpoint (api.stripe.com). You MUST also patch the code:
+
+1. Start the mock container (use the pre-baked recipe command if provided)
+2. Find where the SDK client is initialized in the app code
+3. Modify the initialization code INSIDE THE DOCKER CONTAINER to override the \
+   base URL to point at the mock container on the Docker network
+4. Restart the app process if needed
+
+Examples of SDK patching (do this INSIDE the container via docker exec + sed, \
+or by editing the file before building):
+- Node.js Stripe: Add `apiVersion` and point to mock:
+  const stripe = new Stripe(key, {{ host: '{{container}}-stripe', port: 12111, protocol: 'http' }})
+- Python Stripe: stripe.api_base = "http://{{container}}-stripe:12111"
+- Node.js SendGrid: Override the base URL in the client config
+- Python OpenAI: client = OpenAI(base_url="http://{{container}}-openai:3000/v1")
+- Any SDK: Look for environment variables the SDK respects for base URL override \
+  (e.g., OPENAI_BASE_URL, STRIPE_API_BASE). Set those FIRST, and if the app \
+  doesn't use them, patch the code.
+
+All modifications happen inside the container or in the Dockerfile/build. \
+NEVER modify files on the user's host machine directly. \
+Record every modification in your `done` call under `modifications`.
+
+## Container conventions
+
+- Network name: `{network_name}`
+- App container: `{container_name}`
+- Aux containers: use descriptive names like `{container_name}-postgres`, \
+  `{container_name}-redis`
+- Label all aux containers with: `--label rc-aux-of={project_name}`
+- Always set `--restart=unless-stopped` on all containers
+- Always set resource limits: `--memory` and `--cpus`
+
+## Resource limits
+
+- Stateless app containers: `--memory=512m --cpus=0.5`
+- Databases (postgres, mysql): `--memory=256m --cpus=0.5`
+- Caches (redis, memcached): `--memory=64m --cpus=0.25`
+- Workers/queues: `--memory=256m --cpus=0.25`
+- Never exceed `--memory=2g` on any single container
+- Total sandbox budget: ~2GB RAM. Be stingy.
+
+## Dev-optimized auxiliary services (CRITICAL)
+
+These configs give production-equivalent BEHAVIOR with 1/10th the resources. \
+The app cannot tell the difference.
+
+PostgreSQL — ALWAYS use these flags:
+```
+docker run -d --name {{container_name}}-postgres \
+  --network {{network_name}} \
+  --label rc-aux-of={{project_name}} \
+  --restart unless-stopped \
+  --memory=256m --cpus=0.5 \
+  --shm-size=64m \
+  -e POSTGRES_DB=app -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  postgres:16-alpine \
+  -c shared_buffers=32MB \
+  -c work_mem=4MB \
+  -c maintenance_work_mem=16MB \
+  -c effective_cache_size=128MB \
+  -c max_connections=20 \
+  -c wal_level=minimal \
+  -c max_wal_senders=0 \
+  -c fsync=off \
+  -c synchronous_commit=off \
+  -c full_page_writes=off \
+  -c checkpoint_timeout=30min \
+  -c max_wal_size=256MB
+```
+
+MySQL — ALWAYS use these flags:
+```
+docker run -d --name {{container_name}}-mysql \
+  --memory=256m --cpus=0.5 \
+  mysql:8.0 \
+  --innodb-buffer-pool-size=32M \
+  --innodb-log-file-size=16M \
+  --innodb-flush-log-at-trx-commit=0 \
+  --innodb-flush-method=nosync \
+  --max-connections=20 \
+  --performance-schema=OFF \
+  --skip-log-bin
+```
+
+Redis — ALWAYS use these flags:
+```
+docker run -d --name {{container_name}}-redis \
+  --memory=64m --cpus=0.25 \
+  redis:7-alpine \
+  --maxmemory 32mb \
+  --maxmemory-policy allkeys-lru \
+  --save "" \
+  --appendonly no
+```
+
+MongoDB:
+```
+docker run -d --name {{container_name}}-mongo \
+  --memory=256m --cpus=0.5 \
+  mongo:7 \
+  --wiredTigerCacheSizeGB 0.1 \
+  --nojournal
+```
+
+## .dockerignore (ALWAYS create before building)
+
+If the project does not have a `.dockerignore`, create one before running \
+`docker build`. This saves 50-200MB of build context and speeds up builds:
+
+```
+.git
+node_modules
+.next
+__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+*.md
+tests/
+test/
+spec/
+.github/
+.vscode/
+.idea/
+docker-compose*.yml
+.raincurve/
+```
+
+## BuildKit and cache mounts (ALWAYS use)
+
+Always use `--progress=plain` for builds. Set DOCKER_BUILDKIT=1 as an env var:
+```
+DOCKER_BUILDKIT=1 docker build --progress=plain -t myapp .
+```
+
+When writing Dockerfiles from scratch, use BuildKit cache mounts to make \
+rebuilds near-instant:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM node:22-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY . .
+RUN npm run build
+
+FROM node:22-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/package.json ./
+EXPOSE 3000
+CMD ["npm", "start"]
+```
+
+For Python:
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+COPY . .
+
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY . .
+CMD ["python", "-m", "app.main"]
+```
+
+## Image base selection
+
+- Always use exact version tags: `postgres:16-alpine`, NOT `postgres:latest`
+- Default to `-slim` variants for Python (Alpine breaks some C extensions)
+- Default to `-alpine` for Node.js, Go, Rust
+- For Go/Rust with no CGO: use `scratch` or `gcr.io/distroless` as final stage
+
+## Environment variables
+
+- Read `.env.example` or `.env.sample` for required variables
+- For DATABASE_URL, REDIS_URL, etc.: use the Docker network hostname \
+  (e.g., `postgresql://postgres:postgres@{container_name}-postgres:5432/app`)
+- For SECRET_KEY, JWT_SECRET, etc.: generate a random value
+- For external API keys (Stripe, SendGrid, etc.): see the "Wiring external \
+  services" section above — env vars alone are NOT enough for HTTP API SDKs
+
+## Data seeding
+
+- If the project has migration commands (alembic, prisma, knex, rails db:migrate), \
+  run them after the database is healthy
+- If there are seed scripts, run them
+- Record the seed commands in your `done` call
+
+## Test credentials (IMPORTANT)
+
+After the app is running, find the default login credentials by reading the README, \
+seed files, migration files, or source code. Most apps have a default admin user \
+created during migrations.
+
+In your `done` call, ALWAYS provide `test_credentials` with:
+- `username`: the default username or email
+- `password`: the default password
+- `login_path`: the API endpoint for authentication (e.g. /api/auth/login)
+- `login_body_template`: the JSON body for the login request
+
+This is critical — the seeder agent will use these to log in and populate data.
+
+## Shell rules
+
+- NEVER pass long inline scripts as shell arguments — write to a file, then execute
+- Use `text_editor` to create files (Dockerfiles, scripts, configs)
+- Keep individual shell commands under 4000 characters
+- Use portable commands: prefer `curl` over `wget`, `docker exec` over host-native tools
+
+## DESTRUCTIVE COMMANDS — NEVER DO THESE (ENFORCED — these are blocked)
+
+- NEVER run `DROP DATABASE`, `DROP SCHEMA`, or `TRUNCATE` on any database
+- NEVER delete or recreate a database that already has tables
+- If the database looks wrong, let the app's own migration system fix it on startup
+- If you need a fresh database, stop and recreate the Postgres CONTAINER (not the DB)
+- Most apps run migrations automatically on startup — just start the app and wait
+
+## APP STARTUP PATIENCE — CRITICAL
+
+After starting the app container, WAIT AT LEAST 120 SECONDS before deciding the \
+app is broken. Most apps (NestJS, Rails, Django) run database migrations on first \
+startup which takes 60-120+ seconds. During this time you WILL see errors in the \
+logs about missing tables, failed queries, etc. — THIS IS NORMAL.
+
+DO NOT stop, remove, or recreate the app container during the first 120 seconds. \
+Use `powershell -Command "Start-Sleep -Seconds 120"` then check logs and health.
+
+If the app is still failing AFTER 120 seconds, THEN investigate — but DO NOT \
+remove the container. Instead, check logs and fix the root cause (missing env var, \
+wrong database name, etc.) by restarting with corrected env vars.
+
+## ENVIRONMENT VARIABLES — INCLUDE ALL OF THEM
+
+The env vars in the "Environment variables" section below are MANDATORY. You MUST \
+include ALL of them in your docker run command. Do NOT remove, modify, or omit any \
+of them — they are pre-configured by the orchestrator to wire mock services, Pipe, \
+and infrastructure. If you add your own env vars, ADD them alongside these, never \
+replace them.
+
+## PREFER PRE-BUILT IMAGES
+
+If the project has a docker-compose.yml that specifies a pre-built image \
+(e.g., `image: twentycrm/twenty:latest`), PULL that image instead of building \
+from source. Building from source takes 10-30 minutes; pulling takes 30 seconds.
+
+Steps:
+1. Read the docker-compose.yml (already provided in key files)
+2. Find the main app service's image name
+3. `docker pull <image>`
+4. `docker run` with the pulled image and ALL env vars
+
+Only build from source if there is NO pre-built image in the compose file, or \
+the compose file uses `build:` instead of `image:`.
+
+## Before calling done — STRICT verification (MANDATORY)
+
+You CANNOT call done until you have run ALL of these checks and they pass. \
+If any check fails, you must fix the issue and re-run the check.
+
+### 1. DATABASE CHECK
+If the app uses a database, query it to confirm the schema is loaded:
+  docker exec {{container_name}}-postgres psql -U postgres -d app -c "\\dt"
+This must show application tables (users, posts, etc.), not just system tables. \
+If no tables exist, run migrations first.
+
+### 2. MOCK SERVICE CHECKS
+For EACH mock service you started, verify it responds. Run the check FROM \
+the app container (to prove network connectivity):
+  docker exec {{container_name}} curl -sf http://{{container_name}}-stripe:12111/v1/charges
+  docker exec {{container_name}} curl -sf http://{{container_name}}-redis:6379 || docker exec {{container_name}}-redis redis-cli ping
+Each must return a valid response. If a mock is unreachable, check the Docker \
+network and container names.
+
+### 3. END-TO-END API TEST
+Make at least one real API call that exercises the full stack:
+  curl -X POST http://127.0.0.1:{{port}}/api/users -H "Content-Type: application/json" -d '{{"name":"test"}}'
+This should hit the app, which touches the database and ideally a mock service. \
+A successful response (2xx or 3xx) with a valid body proves the system works. \
+If the app has auth, try hitting a public endpoint or the health/status endpoint \
+with query params that trigger database access.
+
+### 4. REPORT RESULTS
+Include ALL verification results in your `done` call under `verification`:
+- db_check: the command you ran, tables found, success boolean
+- mock_checks: array of {{service, url_tested, status, success}} for each mock
+- api_test: the endpoint, method, status, response snippet, success boolean
+
+## Important
+
+- Do NOT ask the user for help. Figure everything out from the codebase.
+- If a build fails, read the error, fix the issue, and retry.
+- If a service won't start, check `docker logs` for the error.
+- The project directory is: `{project_dir}`
+- You are running commands LOCALLY on the user's machine (not in a VM).
+- You have FULL PERMISSION to modify application source code to make services \
+  work locally. This is a sandbox — not production. Do whatever it takes to get \
+  the app running with all services connected. Record all modifications in your \
+  `done` call.
+- All code modifications should happen either: (a) in the Dockerfile/build process, \
+  or (b) via docker exec into the running container. NEVER modify the user's source \
+  files on the host directly — changes must be inside the container.
+
+{repo_context}
+"""
+
+
+class EnvironmentAgent(BaseAgent):
+    MAX_TOOL_CALLS = MAX_TOOL_CALLS
+    MAX_WALLCLOCK_S = MAX_WALLCLOCK_S
+
+    def __init__(
+        self,
+        project_dir: str,
+        project_name: str,
+        container_name: str,
+        network_name: str,
+        env_overrides: dict[str, str] | None = None,
+        detection_result: object | None = None,
+        repo_brief: object | None = None,
+        on_log: Callable[[str], None] | None = None,
+        pre_started_services: set[str] | None = None,
+        pipe_handled_services: set[str] | None = None,
+        retry_context: str = "",
+    ) -> None:
+        super().__init__(project_dir, on_log)
+        self.project_name = project_name
+        self.container_name = container_name
+        self.network_name = network_name
+        self.env_overrides = env_overrides or {}
+        self.detection_result = detection_result
+        self.repo_brief = repo_brief
+        self.pre_started_services = pre_started_services or set()
+        self.pipe_handled_services = pipe_handled_services or set()
+        self.retry_context = retry_context
+
+    def _build_brief_message(self) -> str:
+        """Build a targeted user message from the pre-analysis brief."""
+        b = self.repo_brief
+        parts = [
+            f"Get this project running in Docker. The project is at: {self.project_dir}\n",
+            f"Docker network '{self.network_name}' already exists — use it for all containers.\n",
+            "\n## Pre-Analysis (already done for you — do NOT re-read these files)\n",
+        ]
+
+        # Stack
+        if b.language != "unknown":
+            line = f"- **Stack**: {b.language}"
+            if b.framework:
+                line += f" / {b.framework}"
+            if b.language_version:
+                line += f" (v{b.language_version})"
+            if b.package_manager:
+                line += f" — package manager: {b.package_manager}"
+            parts.append(line)
+
+        # Dockerfile
+        if b.has_dockerfile:
+            parts.append(f"- **Dockerfile**: exists at `{b.dockerfile_path}`")
+            if b.dockerfile_analysis:
+                da = b.dockerfile_analysis
+                parts.append(f"  - Base image: `{da.base_image}`, Ports: {da.exposed_ports}, Stages: {da.stages}")
+                if da.cmd:
+                    parts.append(f"  - CMD: `{da.cmd}`")
+            parts.append("  - USE this Dockerfile. Do not write a new one unless the build fails.")
+        else:
+            parts.append("- **No Dockerfile found** — you need to write one.")
+
+        # Compose
+        if b.has_compose and b.compose_analysis:
+            ca = b.compose_analysis
+            svc_names = [s.name for s in ca.services]
+            parts.append(f"- **docker-compose.yml**: exists at `{b.compose_path}`")
+            parts.append(f"  - Services: {', '.join(svc_names)}")
+            parts.append(
+                "  - TRY `docker compose up -d` first. If it fails, read the error and fix it. "
+                "This is faster than setting up each service manually."
+            )
+
+        # Database
+        if b.database_type:
+            parts.append(f"- **Database**: {b.database_type}")
+            if b.database_url_pattern:
+                parts.append(f"  - URL pattern: `{b.database_url_pattern}`")
+
+        # Migrations
+        if b.migration_tool:
+            parts.append(f"- **Migrations**: {b.migration_tool} — run `{b.migration_command}`")
+        if b.seed_command:
+            parts.append(f"- **Seed**: `{b.seed_command}`")
+
+        # Port
+        if b.app_port:
+            parts.append(f"- **App port**: {b.app_port}")
+
+        # Start/build commands
+        if b.build_command:
+            parts.append(f"- **Build command**: `{b.build_command}`")
+        if b.start_command:
+            parts.append(f"- **Start command**: `{b.start_command}`")
+
+        # Services — merge from brief and from detection_result
+        from raincurve.services.recipes import (
+            get_recipe, build_docker_run_cmd, DISABLEABLE_SERVICES,
+        )
+
+        all_svc_names: list[str] = []
+        if self.detection_result:
+            for svc in self.detection_result.detected_services:
+                all_svc_names.append(svc.name)
+        # Also add from repo_brief.detected_services
+        for s in b.detected_services:
+            if s.name not in [n for n in all_svc_names]:
+                all_svc_names.append(s.name)
+
+        required = [n for n in all_svc_names if n not in DISABLEABLE_SERVICES]
+        disableable = [n for n in all_svc_names if n in DISABLEABLE_SERVICES]
+
+        already_handled = self.pre_started_services | self.pipe_handled_services
+        needs_agent = [n for n in required if n not in already_handled]
+
+        if self.pre_started_services or self.pipe_handled_services:
+            parts.append(
+                "\n## ALREADY RUNNING services (do NOT start these — they are live)\n"
+                "These services are already running and their env vars are in the "
+                "environment variables section below. Do NOT start containers for them. "
+                "Just make sure the app code points at them (patch SDK base URLs if needed)."
+            )
+            for svc_name in sorted(self.pre_started_services):
+                svc_container = f"{self.container_name}-{svc_name}"
+                parts.append(f"- **{svc_name}** — container `{svc_container}` is running")
+            for svc_name in sorted(self.pipe_handled_services):
+                parts.append(
+                    f"- **{svc_name}** — handled by Pipe (LLM mock at "
+                    f"`host.docker.internal:19877/{svc_name}`). No container needed."
+                )
+
+        if needs_agent:
+            parts.append(
+                "\n## Services that NEED setup\n"
+                "These are not yet running. Set up a working local replacement for each."
+            )
+            for svc_name in needs_agent:
+                recipe = get_recipe(svc_name)
+                if recipe:
+                    cmd = build_docker_run_cmd(
+                        recipe, self.container_name, self.network_name, self.project_name,
+                    )
+                    parts.append(f"\n**{svc_name}** — pre-baked recipe available:")
+                    parts.append(f"```\n{cmd}\n```")
+                    if recipe.env_wiring:
+                        wiring = ", ".join(
+                            f"`{k}={v}`" for k, v in recipe.env_wiring.items()
+                        )
+                        parts.append(f"Set on app container: {wiring}")
+                else:
+                    parts.append(
+                        f"\n**{svc_name}** — no pre-baked recipe. Use `web_search` "
+                        f"to find the right local replacement or mock for {svc_name}."
+                    )
+
+        # SDK import locations
+        if self.detection_result and self.detection_result.import_hits:
+            parts.append("\n## SDK import locations (where to find and patch SDK initialization)\n")
+            parts.append(
+                "These files import external service SDKs. When you need to patch "
+                "SDK client initialization to point at a local mock, check these files first.\n"
+            )
+            for svc_name, files in self.detection_result.import_hits.items():
+                file_list = ", ".join(f"`{f}`" for f in files[:5])
+                parts.append(f"- **{svc_name}**: {file_list}")
+
+        if disableable:
+            parts.append("\n## Optional services (can be disabled)")
+            for svc_name in disableable:
+                parts.append(f"- **{svc_name}**: disable via environment variable if no local replacement exists")
+
+        # Env overrides
+        if self.env_overrides:
+            parts.append("\n## Environment variables (provided by user)")
+            for k, v in self.env_overrides.items():
+                parts.append(f"  {k}={v}")
+
+        # Key file contents (for agent to reference without reading)
+        if b.key_file_contents:
+            parts.append("\n## Key file contents (already read)")
+            for fname, content in list(b.key_file_contents.items())[:8]:
+                truncated = content[:3000] if len(content) > 3000 else content
+                parts.append(f"\n### {fname}\n```\n{truncated}\n```")
+
+        return "\n".join(parts)
+
+    def run(self) -> AgentResult:
+        repo_context = build_repo_context(self.project_dir)
+        system = SYSTEM_PROMPT.format(
+            project_dir=self.project_dir,
+            project_name=self.project_name,
+            container_name=self.container_name,
+            network_name=self.network_name,
+            repo_context=repo_context,
+        )
+
+        if self.repo_brief:
+            user_msg = self._build_brief_message()
+        else:
+            user_msg = (
+                f"Get this project running in Docker. The project is at: {self.project_dir}\n\n"
+                f"Docker network '{self.network_name}' already exists — use it for all containers.\n"
+            )
+            if self.detection_result and self.detection_result.detected_services:
+                svc_lines = []
+                for svc in self.detection_result.detected_services:
+                    env_hint = ", ".join(svc.env_vars[:4])
+                    svc_lines.append(f"- {svc.name} ({svc.description}): env vars [{env_hint}]")
+                if self.detection_result.import_hits:
+                    svc_lines.append("\nImport locations:")
+                    for svc_name, files in self.detection_result.import_hits.items():
+                        svc_lines.append(f"  {svc_name}: {', '.join(files[:3])}")
+                detected_services_text = "\n".join(svc_lines)
+                user_msg += (
+                    "\n## External services detected in this codebase\n\n"
+                    "You MUST set up local replacements for these. Use `web_search` and `web_fetch` "
+                    "to find the right Docker images and setup instructions. Do NOT skip them.\n\n"
+                    f"{detected_services_text}\n"
+                )
+            if self.env_overrides:
+                user_msg += "\nThe user provided these environment variables:\n"
+                for k, v in self.env_overrides.items():
+                    user_msg += f"  {k}={v}\n"
+
+        if self.retry_context:
+            user_msg += "\n" + self.retry_context
+
+        return self._run_loop(system, user_msg, TOOLS, self._handle_tool)
+
+    def _handle_tool(self, name: str, args: dict) -> str:
+        if name == "bash":
+            return self._handle_bash(args)
+        elif name == "text_editor":
+            return self._handle_text_editor(args)
+        elif name == "web_fetch":
+            return self._handle_web_fetch(args)
+        elif name == "web_search":
+            return self._handle_web_search(args)
+        else:
+            return f"Unknown tool: {name}"
+
+    _BLOCKING_PATTERNS = [
+        "docker logs -f", "docker logs --follow",
+        "tail -f", "tail --follow",
+        "watch ", "nodemon",
+        "-f rc-", "--follow rc-",
+    ]
+
+    _DESTRUCTIVE_PATTERNS = [
+        "drop database", "drop schema", "truncate ",
+        "dropdb ", "dropdb\n",
+    ]
+
+    def _handle_bash(self, args: dict) -> str:
+        cmd = args["command"]
+        cwd = args.get("cwd", "")
+
+        cmd_lower = cmd.lower()
+        for pattern in self._DESTRUCTIVE_PATTERNS:
+            if pattern in cmd_lower:
+                return (
+                    "BLOCKED: Destructive database commands are forbidden. "
+                    "NEVER run DROP DATABASE, DROP SCHEMA, or TRUNCATE. "
+                    "If the database has issues, restart the Postgres container "
+                    "or let the app's migration system handle it on startup."
+                )
+        timeout = args.get("timeout_s", 120)
+
+        for pattern in self._BLOCKING_PATTERNS:
+            if pattern in cmd:
+                return (
+                    f"BLOCKED: '{pattern}' is a blocking command that will hang. "
+                    f"Use non-follow alternatives instead: 'docker logs <name>' (without -f), "
+                    f"'docker logs --tail 50 <name>', or poll with a timeout."
+                )
+
+        if cwd:
+            full_cwd = str(Path(self.project_dir) / cwd)
+        else:
+            full_cwd = self.project_dir
+
+        self._log(f"$ {cmd}")
+        result = _exec_bash(cmd, full_cwd, timeout)
+
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            output += f"\nSTDERR:\n{result.stderr}" if output else result.stderr
+
+        if not output:
+            output = "(no output)"
+
+        return f"exit_code={result.exit_code}\n{output}"
+
+    def _handle_text_editor(self, args: dict) -> str:
+        command = args["command"]
+        rel_path = args["path"]
+        full_path = Path(self.project_dir) / rel_path
+
+        if command == "view":
+            return self._editor_view(full_path, args.get("view_range"))
+        elif command == "create":
+            return self._editor_create(full_path, args.get("file_text", ""))
+        elif command == "str_replace":
+            return self._editor_replace(full_path, args.get("old_str", ""), args.get("new_str", ""))
+        else:
+            return f"Unknown editor command: {command}"
+
+    def _editor_view(self, path: Path, view_range: list[int] | None) -> str:
+        if not path.exists():
+            return f"File not found: {path}"
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (PermissionError, OSError) as e:
+            return f"Error reading {path}: {e}"
+
+        lines = content.splitlines()
+        if view_range and len(view_range) == 2:
+            start, end = view_range
+            lines = lines[max(0, start - 1):end]
+            numbered = [f"{i + start}: {line}" for i, line in enumerate(lines)]
+        else:
+            numbered = [f"{i + 1}: {line}" for i, line in enumerate(lines)]
+
+        return "\n".join(numbered)
+
+    def _editor_create(self, path: Path, content: str) -> str:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        self._log(f"Created {path.relative_to(self.project_dir)}")
+
+        lint_err = self._lint_file(path)
+        if lint_err:
+            return f"File created but lint failed:\n{lint_err}"
+        return f"Created {path}"
+
+    def _editor_replace(self, path: Path, old_str: str, new_str: str) -> str:
+        if not path.exists():
+            return f"File not found: {path}"
+        content = path.read_text(encoding="utf-8", errors="replace")
+        if old_str not in content:
+            return f"old_str not found in {path}"
+
+        count = content.count(old_str)
+        new_content = content.replace(old_str, new_str, 1)
+        path.write_text(new_content, encoding="utf-8")
+        self._log(f"Edited {path.relative_to(self.project_dir)}")
+
+        lint_err = self._lint_file(path)
+        if lint_err:
+            path.write_text(content, encoding="utf-8")
+            return f"Edit reverted — lint failed:\n{lint_err}"
+        return f"Replaced in {path} ({count} occurrence(s) found, replaced first)"
+
+    def _lint_file(self, path: Path) -> str | None:
+        suffix = path.suffix
+        if suffix == ".sh":
+            r = _exec_bash(f"bash -n {path}", str(path.parent), timeout_s=10)
+            if not r.ok:
+                return r.stderr
+        elif suffix == ".py":
+            try:
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            except SyntaxError as e:
+                return str(e)
+        return None
+
+    def _handle_web_fetch(self, args: dict) -> str:
+        url = args.get("url", "")
+        if not url:
+            return "Error: no URL provided"
+
+        self._log(f"Fetching: {url}")
+
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "raincurve/0.1 (sandbox-builder)"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                raw = resp.read(200_000)  # Cap at 200KB
+                text = raw.decode("utf-8", errors="replace")
+
+            # For HTML pages, extract text content (strip tags)
+            if "html" in content_type:
+                text = self._strip_html(text)
+
+            return _truncate(text, head=8000, tail=4000)
+
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as e:
+            return f"Fetch failed: {e}"
+
+    def _handle_web_search(self, args: dict) -> str:
+        query = args.get("query", "")
+        if not query:
+            return "Error: no query provided"
+
+        self._log(f"Searching: {query}")
+
+        # Use DuckDuckGo HTML search (no API key needed)
+        encoded_q = urllib.parse.quote(query)
+        url = f"https://html.duckduckgo.com/html/?q={encoded_q}"
+
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "raincurve/0.1 (sandbox-builder)"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read(100_000)
+                html = raw.decode("utf-8", errors="replace")
+
+            # Extract search result links and snippets
+            results = self._parse_ddg_results(html)
+            if not results:
+                return "No results found."
+
+            output_parts = []
+            for i, r in enumerate(results[:8], 1):
+                output_parts.append(f"{i}. {r['title']}\n   {r['url']}\n   {r['snippet']}")
+
+            return "\n\n".join(output_parts)
+
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as e:
+            return f"Search failed: {e}"
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
+        html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.DOTALL)
+        html = re.sub(r"<[^>]+>", " ", html)
+        html = re.sub(r"\s+", " ", html)
+        return html.strip()
+
+    @staticmethod
+    def _parse_ddg_results(html: str) -> list[dict[str, str]]:
+        results = []
+        # DuckDuckGo HTML results are in <a class="result__a"> with <a class="result__snippet">
+        link_pattern = re.compile(
+            r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL
+        )
+        snippet_pattern = re.compile(
+            r'class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL
+        )
+
+        links = link_pattern.findall(html)
+        snippets = snippet_pattern.findall(html)
+
+        for i, (url, title) in enumerate(links):
+            title_clean = re.sub(r"<[^>]+>", "", title).strip()
+            snippet = ""
+            if i < len(snippets):
+                snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+            # DuckDuckGo wraps URLs in a redirect — extract the real URL
+            if "uddg=" in url:
+                match = re.search(r"uddg=([^&]+)", url)
+                if match:
+                    url = urllib.parse.unquote(match.group(1))
+            results.append({"url": url, "title": title_clean, "snippet": snippet})
+
+        return results
+
+    def _verify_done(self, done_output: dict) -> str | None:
+        import time
+
+        port = done_output.get("port")
+        health_path = done_output.get("health_path", "/")
+        if not port:
+            return "No port provided in done call."
+
+        # 1. Check verification evidence is present
+        verification = done_output.get("verification")
+        if not verification:
+            return (
+                "MISSING VERIFICATION. You must run these checks before calling done:\n"
+                "1. Query the database to confirm tables exist\n"
+                "2. Curl each mock service to confirm it responds\n"
+                "3. Run at least one end-to-end API test\n"
+                "Include results in the 'verification' field of your done call."
+            )
+
+        failures = []
+
+        # 2. Validate DB check
+        db_check = verification.get("db_check", {})
+        if not db_check.get("success"):
+            failures.append(
+                "DATABASE CHECK FAILED: No tables found or check was not run. "
+                "Run migrations and verify the schema is loaded."
+            )
+        elif not db_check.get("tables_found"):
+            failures.append(
+                "DATABASE CHECK INCOMPLETE: 'tables_found' is empty. "
+                "Query the database and list the tables."
+            )
+
+        # 3. Validate mock checks
+        mock_checks = verification.get("mock_checks", [])
+        # Check required services are in the mock_checks
+        if self.detection_result:
+            from raincurve.services.recipes import DISABLEABLE_SERVICES, get_recipe
+            for svc in self.detection_result.detected_services:
+                if svc.name not in DISABLEABLE_SERVICES:
+                    recipe = get_recipe(svc.name)
+                    if recipe:
+                        checked = any(
+                            m.get("service", "").lower() == svc.name.lower()
+                            for m in mock_checks
+                        )
+                        if not checked:
+                            failures.append(
+                                f"MOCK CHECK MISSING for {svc.name}: "
+                                f"You must curl the {svc.name} mock service and include the result."
+                            )
+
+        for mc in mock_checks:
+            if not mc.get("success"):
+                failures.append(
+                    f"MOCK CHECK FAILED for {mc.get('service', '?')}: "
+                    f"URL {mc.get('url_tested', '?')} did not respond. "
+                    f"Check that the container is running and on the correct network."
+                )
+
+        # 4. Validate API test
+        api_test = verification.get("api_test", {})
+        if not api_test.get("success"):
+            failures.append(
+                "END-TO-END API TEST FAILED: The API test did not succeed. "
+                "Try a different endpoint or fix the issue that caused the failure."
+            )
+
+        if failures:
+            # Gather container logs for diagnostics
+            diag = []
+            for svc in done_output.get("services", []):
+                cname = svc.get("container_name", "")
+                if cname:
+                    r = _exec_bash(f"docker logs --tail 30 {cname}", self.project_dir, timeout_s=10)
+                    if r.stdout or r.stderr:
+                        diag.append(f"\n--- logs {cname} ---\n{r.stdout}\n{r.stderr}")
+
+            return (
+                "VERIFICATION FAILED. Fix these issues and try again:\n\n"
+                + "\n\n".join(failures)
+                + ("\n\n--- Container diagnostics ---" + "".join(diag) if diag else "")
+            )
+
+        # 5. Independent health check (we still verify the app responds)
+        url = f"http://127.0.0.1:{port}{health_path}"
+        self._log(f"Verifying health: {url}")
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if resp.status < 500:
+                        self._log(f"Health check passed (HTTP {resp.status})")
+                        return None
+            except (urllib.error.URLError, OSError, TimeoutError):
+                pass
+            if attempt < 2:
+                time.sleep(5)
+
+        # Health check failed - gather diagnostics
+        diag_parts = [f"App health check failed: {url} did not respond after 3 attempts."]
+        for svc in done_output.get("services", []):
+            cname = svc.get("container_name", "")
+            if cname:
+                r = _exec_bash(f"docker logs --tail 50 {cname}", self.project_dir, timeout_s=10)
+                diag_parts.append(f"\n--- docker logs {cname} ---\n{r.stdout}\n{r.stderr}")
+        r = _exec_bash("docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'", self.project_dir, timeout_s=10)
+        diag_parts.append(f"\n--- docker ps ---\n{r.stdout}")
+        return "\n".join(diag_parts)

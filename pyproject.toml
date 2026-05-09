@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "raincurve"
+version = "0.1.1"
+description = "One command to run any codebase locally — AI agents analyze your project, build containers, start services, seed data, and give you a production-grade sandbox in Docker"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+
+dependencies = [
+    "typer[all]>=0.12",
+    "rich>=13.7",
+    "docker>=7.1",
+    "anthropic>=0.28",
+    "openai>=1.35",
+    "watchdog>=4.0",
+    "httpx>=0.27",
+    "keyring>=25.0",
+    "pydantic>=2.7",
+    "faker>=25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.14",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+raincurve = "raincurve.main:app"
+
+[tool.hatchling.build.targets.wheel]
+packages = ["raincurve"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
