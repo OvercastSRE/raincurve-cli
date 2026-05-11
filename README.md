@@ -8,7 +8,7 @@
   <!-- TODO: Uncomment and update these badges as applicable -->
   <!-- <a href="https://raincurve.dev/docs"><img src="https://img.shields.io/badge/Docs-raincurve.dev-blue?style=for-the-badge" alt="Documentation"></a> -->
   <!-- <a href="https://discord.gg/YOUR_INVITE"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a> -->
-  <a href="https://github.com/raincurve/raincurve-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge" alt="License: Apache 2.0"></a>
+  <a href="https://github.com/OvercastSRE/raincurve-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green?style=for-the-badge" alt="License: Apache 2.0"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11+"></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-required-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"></a>
 </p>
@@ -56,7 +56,7 @@ pip install raincurve
 ### From source
 
 ```bash
-git clone https://github.com/raincurve/raincurve-cli.git
+git clone https://github.com/OvercastSRE/raincurve-cli.git
 cd raincurve-cli
 pip install -e ".[dev]"
 ```
@@ -239,7 +239,7 @@ Most local dev tools give you a `docker-compose.yml` template and call it a day.
 We welcome contributions! Clone the repo and install in editable mode:
 
 ```bash
-git clone https://github.com/raincurve/raincurve-cli.git
+git clone https://github.com/OvercastSRE/raincurve-cli.git
 cd raincurve-cli
 pip install -e ".[dev]"
 ```
@@ -275,7 +275,7 @@ pytest tests/test_foo.py::test_bar    # single test
 <!-- - **Website:** https://raincurve.dev -->
 <!-- - **Docs:** https://raincurve.dev/docs -->
 <!-- - **Discord:** https://discord.gg/YOUR_INVITE -->
-- **Issues:** https://github.com/raincurve/raincurve-cli/issues
+- **Issues:** https://github.com/OvercastSRE/raincurve-cli/issues
 
 ---
 
