@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Raincurve" height="60">
+  <img src="assets/logo.png" alt="Raincurve" height="120">
 </p>
 
-# Raincurve CLI
+
 
 <p align="center">
   <!-- TODO: Uncomment and update these badges as applicable -->
@@ -19,6 +19,16 @@
 cd any-project/
 raincurve sandbox
 ```
+
+### Raincurve on a hosted environment
+
+> This demo shows Raincurve running inside [Raincurve](https://platform.overcastsre.com), our hosted platform that spins up sandboxes in cloud E2B boxes instead of local Docker. The agent analyzes the codebase, brings up a full production replica, then automatically generates and runs failure scenarios against it.
+
+<p align="center">
+  <img src="assets/demo.gif" alt="Raincurve demo — analyzing a codebase, building a production sandbox, and running failure scenarios" width="700">
+</p>
+
+> The CLI does the same thing locally on your machine with Docker. The main application is the cloud-hosted version.
 
 <table>
 <tr><td><b>Stack-agnostic analysis</b></td><td>Reads your code, package files, and project docs to detect frameworks, databases, caches, queues, and external dependencies — Python, Node.js, Go, Java, Ruby, or anything else.</td></tr>
