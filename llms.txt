@@ -1,0 +1,140 @@
+# Raincurve CLI
+
+> One command to run a production replica of any codebase in Docker. AI agents analyze the stack, build containers, start services, seed data, and hand you a working sandbox.
+
+Raincurve is a Python CLI that creates high-fidelity local or remote production replicas in Docker. Given any codebase, it uses LLM agents to analyze the project, build Docker containers, start auxiliary services (databases, caches), seed data, and watch for file changes to auto-rebuild.
+
+## Install
+
+```bash
+pip install raincurve
+raincurve init  # configure LLM provider (OpenRouter / Claude / OpenAI)
+```
+
+Requirements: Python 3.11+, Docker running, an LLM API key.
+
+## Local sandbox
+
+```bash
+cd any-project/
+raincurve sandbox        # analyze + build + seed + test
+raincurve sandbox -y     # skip trust confirmation
+raincurve chat           # interactive chat with the running sandbox
+raincurve chat "message" # one-shot mode
+raincurve down           # snapshot + tear down
+raincurve up             # restore from snapshot
+raincurve doctor         # check system readiness
+```
+
+## Remote sandbox (over SSH)
+
+Run sandboxes on remote machines — AWS EC2, GCP, Azure, any Linux box with SSH.
+
+### Setup (one-time)
+
+```bash
+raincurve remote setup ubuntu@<host-ip> --key ~/.ssh/mykey.pem
+```
+
+Installs Docker + raincurve on the remote, pushes LLM API key. Host is saved as default.
+
+### Spin up a sandbox
+
+```bash
+raincurve remote sandbox https://github.com/org/repo.git --env-file prod.env
+```
+
+Options:
+- `--host/-H user@ip` — SSH connection (uses saved default if omitted)
+- `--env-file/-e path` — local .env file to upload to the remote
+- `--env KEY=VALUE` — individual env var, repeatable
+- `--key/-k path` — SSH private key
+- `--port/-p N` — SSH port (default 22)
+- `--yes/-y` — skip approval prompt
+- `--json` — structured JSON output
+
+### Reproduce a bug
+
+```bash
+raincurve remote reproduce "Users see wrong totals on /api/invoices with date range > 30 days"
+```
+
+The agent reads source code, queries databases, traces logic, triggers the bug, and generates:
+- A JSON report with root cause, severity, evidence
+- A `.prompt.md` file ready to paste into Claude or Cursor for a fix
+
+Options:
+- `--repo/-r url` — auto-provisions sandbox if not running
+- `--env-file/-e path` — env file (used during auto-provisioning)
+- `--env KEY=VALUE` — env var (used during auto-provisioning)
+- `--project path` — remote project directory (uses last sandbox if omitted)
+- `--json` — structured JSON output
+
+### Full auto-provision (zero to reproduce in one command)
+
+```bash
+raincurve remote reproduce "bug description" \
+  --host ubuntu@52.x.x.x --key ~/.ssh/key.pem \
+  --repo https://github.com/org/app.git --env-file .env
+```
+
+This single command: provisions the server → clones the repo → builds the sandbox → reproduces the bug → generates a report. After the first run, just use `raincurve remote reproduce "new bug"`.
+
+### Interactive chat
+
+```bash
+raincurve remote chat
+```
+
+Live interactive session with the remote sandbox agent. Guide it in real time — fix builds, investigate issues, run commands.
+
+### Status and teardown
+
+```bash
+raincurve remote status      # check running containers
+raincurve remote teardown    # snapshot + tear down
+```
+
+## Architecture
+
+Multi-agent system. Each agent has its own tools, system prompt, and resource limits.
+
+Pipeline: `raincurve sandbox` runs 5 steps:
+1. CodeAnalysisAgent — reads and understands the codebase
+2. InfraAgent — sets up databases, caches, external services
+3. EnvironmentAgent — builds and runs the app in Docker (100 tool calls, 900s limit)
+4. SeederAgent — populates with realistic data via API endpoints
+5. E2EAgent — end-to-end smoke tests
+
+RecoveryAgent auto-fixes Docker build failures. ChatAgent provides interactive sandbox access (60 tool calls, 600s limit).
+
+Remote module (`raincurve/remote/`):
+- `connection.py` — SSH client via subprocess (run, stream, interactive, scp)
+- `provisioner.py` — Docker/raincurve installation, repo cloning, LLM config, state management
+
+Config stored at:
+- Global: `~/.raincurve/global.json` (LLM keys, auth, resource budgets)
+- Project: `.raincurve/config.json` (per-project services, env vars)
+- Remote hosts: `~/.raincurve/remotes.json` (saved SSH connections)
+- Active project: `~/.raincurve/remote_state.json` (last sandbox directory)
+- Reports: `~/.raincurve/reports/` (reproduce results + coding agent prompts)
+
+## JSON output
+
+Both `sandbox` and `reproduce` support `--json` for CI/agent integration:
+
+```bash
+raincurve remote sandbox https://github.com/org/app.git --json
+raincurve remote reproduce "bug" --json
+```
+
+The reproduce JSON includes a `coding_agent_prompt` field — a ready-to-use prompt for Claude, Cursor, or any coding agent.
+
+## Key conventions
+
+- Docker container names: `rc-{hash}` (app), `rc-{hash}-{service}` (auxiliary)
+- Docker network: `rc-{hash}-net`
+- Port range: 30000-39999
+- All containers labeled `rc-aux-of={project}` for cleanup
+- Remote sandbox directory: `~/raincurve-sandboxes/{repo-name}/`
+- SSH uses system OpenSSH (no extra dependencies)

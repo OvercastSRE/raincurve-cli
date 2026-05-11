@@ -132,6 +132,17 @@ Each step is handled by a dedicated AI agent with its own tool set, limits, and 
 | `raincurve help` | Show detailed help and examples |
 | `raincurve --version` | Print version |
 
+### Remote commands
+
+| Command | Description |
+|---------|-------------|
+| `raincurve remote setup <user@host>` | Connect to a remote machine, install Docker + raincurve, configure LLM |
+| `raincurve remote sandbox <repo-url>` | Clone a repo on the remote, spin up a production sandbox |
+| `raincurve remote reproduce "bug"` | Investigate a bug in the running sandbox, generate a report for coding agents |
+| `raincurve remote chat` | Interactive chat with the remote sandbox — guide the agent in real time |
+| `raincurve remote status` | Check what's running on the remote sandbox |
+| `raincurve remote teardown` | Tear down the remote sandbox and clean up containers |
+
 ### Chat tools
 
 When inside `raincurve chat`, the agent has access to:
@@ -165,6 +176,9 @@ raincurve/
 │   ├── container_script.py    # Accessibility-tree-driven browser control
 │   └── viewer.py              # Local live viewer (port 19876)
 ├── cli/                       # Typer command implementations
+├── remote/                    # SSH-based remote sandbox operations
+│   ├── connection.py          # RemoteHost SSH client (run, stream, interactive, scp)
+│   └── provisioner.py         # Remote machine setup, repo cloning, config management
 ├── config/                    # Pydantic config schemas (global + project)
 ├── context/                   # Shared state between agents
 ├── docker/                    # Docker SDK utilities
@@ -231,6 +245,66 @@ Most local dev tools give you a `docker-compose.yml` template and call it a day.
 - **Self-healing builds.** When a Docker build fails, the recovery agent reads the error, patches the Dockerfile, and retries. You don't debug `apt-get` failures.
 - **External API stubs.** Your app calls Stripe? Raincurve starts a mock Stripe server. No real API keys needed for local dev.
 - **Works on any stack.** Python, Node.js, Go, Java, Ruby — the agents are language-agnostic. If it can run in Docker, Raincurve can sandbox it.
+
+---
+
+## Remote Sandboxes
+
+Raincurve can provision and run sandboxes on remote machines over SSH — AWS EC2, GCP Compute Engine, Azure VMs, DigitalOcean, or any Linux box with an SSH key.
+
+### One-command setup
+
+```bash
+# First time: point raincurve at your server
+raincurve remote setup ubuntu@ec2-34-xx-xx-xx.amazonaws.com --key ~/.ssh/mykey.pem
+```
+
+This SSHs in, installs Docker (if missing), installs raincurve, and pushes your LLM API key to the remote. The host is saved — you won't need to type it again.
+
+### Run a sandbox
+
+```bash
+raincurve remote sandbox https://github.com/your-org/your-app.git --env-file prod.env
+```
+
+Raincurve clones the repo on the remote, uploads your environment variables, shows you the plan for approval, then runs the full pipeline: analyze → build → services → seed → test. Output is streamed live to your terminal.
+
+If the build fails, raincurve offers to drop you into an interactive chat session so you can guide the agent ("try node 18 instead of 20", "the migration script is in scripts/init.sql").
+
+### Reproduce bugs
+
+```bash
+raincurve remote reproduce "Users see wrong invoice totals when filtering by date range > 30 days"
+```
+
+The agent reads the source code, queries databases, traces the logic path, triggers the bug, and compares actual vs expected output. This isn't just endpoint probing — it catches data correctness issues where the API returns 200 OK but the numbers are wrong.
+
+The output includes:
+- **Root cause analysis** — exact file, function, and line where the logic breaks
+- **Reproduction commands** — the curl/psql commands that trigger the bug
+- **A `.prompt.md` file** — paste it into Claude or Cursor to get a fix
+
+### Full auto-provision
+
+If nothing is set up, `reproduce` handles everything automatically:
+
+```bash
+# This single command provisions the server, builds the sandbox, AND reproduces the bug:
+raincurve remote reproduce "bug description" \
+  --host ubuntu@52.x.x.x --key ~/.ssh/key.pem \
+  --repo https://github.com/org/app.git --env-file .env
+```
+
+After the first run, subsequent commands just need the bug description — host, repo, and sandbox state are all saved.
+
+### Interactive guidance
+
+```bash
+# Jump into a live chat session with the remote sandbox anytime:
+raincurve remote chat
+```
+
+You type instructions, the agent executes them on the remote sandbox, you watch the results. Useful for guiding the agent through complex setups or debugging edge cases.
 
 ---
 

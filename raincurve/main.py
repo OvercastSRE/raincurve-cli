@@ -72,6 +72,11 @@ def help_cmd() -> None:
     run_help()
 
 
+from raincurve.cli.cmd_remote import remote_app  # noqa: E402
+
+app.add_typer(remote_app, name="remote")
+
+
 @app.callback(invoke_without_command=True)
 def version_callback(
     version: bool = typer.Option(False, "--version", "-v", help="Show version"),
