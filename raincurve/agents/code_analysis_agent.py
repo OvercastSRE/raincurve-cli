@@ -448,9 +448,12 @@ class CodeAnalysisAgent(BaseAgent):
         matches: list[str] = []
 
         for fpath in root.rglob("*"):
-            if not fpath.is_file():
-                continue
             if any(skip in fpath.parts for skip in SKIP_DIRS):
+                continue
+            try:
+                if not fpath.is_file():
+                    continue
+            except OSError:
                 continue
             if file_glob and not fpath.match(file_glob):
                 continue

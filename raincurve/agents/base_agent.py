@@ -7,6 +7,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from raincurve.agents.cognition import AgentCognition, REACT_INSTRUCTION
+from raincurve.agents.error_classifier import classify as classify_error
+from raincurve.agents.memory import EpisodicMemory, DeclarativeMemory
+from raincurve.agents.tool_guardrails import ToolGuardrails, _looks_like_error
 from raincurve.config import load_global_config
 
 
@@ -90,7 +94,7 @@ def _exec_bash(cmd: str, cwd: str, timeout_s: int = 120, env: dict[str, str] | N
 
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_DEFAULT_KEY = "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"
+OPENROUTER_DEFAULT_KEY = os.environ.get("RAINCURVE_OPENROUTER_KEY", "")
 
 
 def _get_llm_client(provider: str | None = None, model_override: str | None = None):
@@ -209,6 +213,13 @@ class BaseAgent:
         provider_name, model, client = _get_llm_client(model_override=self.MODEL_OVERRIDE)
         start = time.time()
 
+        session_id = time.strftime("%Y%m%d_%H%M%S")
+        self._cognition = AgentCognition(
+            episodic=EpisodicMemory(self.project_dir, session_id),
+            declarative=DeclarativeMemory(self.project_dir),
+        )
+        system_prompt = system_prompt + REACT_INSTRUCTION
+
         if provider_name == "anthropic":
             return self._run_anthropic_loop(
                 client, model, system_prompt, initial_message, tools, tool_handler, start
@@ -231,6 +242,9 @@ class BaseAgent:
         messages: list[dict] = [{"role": "user", "content": initial_message}]
         tool_call_count = 0
         done_result: dict | None = None
+        guardrails = ToolGuardrails()
+        compressed_this_iteration = False
+        api_retries = 0
 
         while True:
             elapsed = time.time() - start
@@ -253,10 +267,14 @@ class BaseAgent:
                 messages = self._compact_messages(messages)
 
             try:
+                effective_prompt = system_prompt
+                cog_ctx = self._cognition.build_cognitive_context()
+                if cog_ctx:
+                    effective_prompt = system_prompt + f"\n\n## Session State\n{cog_ctx}"
                 system_blocks = [
                     {
                         "type": "text",
-                        "text": system_prompt,
+                        "text": effective_prompt,
                         "cache_control": {"type": "ephemeral"},
                     }
                 ]
@@ -271,16 +289,33 @@ class BaseAgent:
                     messages=messages,
                     tools=cached_tools,
                 )
+                compressed_this_iteration = False
+                api_retries = 0
             except Exception as api_err:
-                err_msg = str(api_err)
-                if "credit balance" in err_msg or "rate_limit" in err_msg:
+                classified = classify_error(api_err)
+                api_retries += 1
+                self._log(f"API error ({classified.category}): {classified.message[:150]}")
+                if api_retries > 5:
                     return AgentResult(
                         success=False,
-                        failure_reason=f"API error: {err_msg[:200]}",
+                        failure_reason=f"API error after {api_retries} retries ({classified.category}): {classified.message[:200]}",
                         duration_s=time.time() - start,
                         tool_call_count=tool_call_count,
                     )
-                raise
+                if classified.should_compress and not compressed_this_iteration:
+                    messages = self._compact_messages(messages)
+                    compressed_this_iteration = True
+                    continue
+                if classified.retryable:
+                    if classified.wait_seconds:
+                        time.sleep(classified.wait_seconds)
+                    continue
+                return AgentResult(
+                    success=False,
+                    failure_reason=f"API error ({classified.category}): {classified.message[:200]}",
+                    duration_s=time.time() - start,
+                    tool_call_count=tool_call_count,
+                )
 
             assistant_blocks: list[dict] = []
             tool_results: list[dict] = []
@@ -289,6 +324,7 @@ class BaseAgent:
                 if block.type == "text":
                     self._log(block.text)
                     assistant_blocks.append({"type": "text", "text": block.text})
+                    self._cognition.extract_reasoning(block.text)
                 elif block.type == "tool_use":
                     tool_call_count += 1
                     assistant_blocks.append({
@@ -309,6 +345,17 @@ class BaseAgent:
                         result = tool_handler(block.name, block.input)
                         result_str = result if isinstance(result, str) else json.dumps(result)
                         result_str = _truncate(result_str)
+                        self._cognition.record_tool_call(
+                            block.name, block.input, result_str[:200],
+                            _looks_like_error(result_str),
+                        )
+                        guardrail_msg = guardrails.check(block.name, block.input, result_str)
+                        if guardrail_msg:
+                            self._log(f"Guardrail: {guardrail_msg[:100]}")
+                            if guardrail_msg.startswith("BLOCKED:"):
+                                result_str = guardrail_msg
+                            else:
+                                result_str = result_str + "\n\n" + guardrail_msg
                         tool_results.append({
                             "type": "tool_result",
                             "tool_use_id": block.id,
@@ -318,6 +365,12 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": assistant_blocks})
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
+
+            if self._cognition.should_reflect():
+                messages.append({
+                    "role": "user",
+                    "content": self._cognition.build_reflection_prompt(),
+                })
 
             if done_result is not None:
                 verification = self._verify_done(done_result)
@@ -333,9 +386,7 @@ class BaseAgent:
                     done_result = None
                     messages.append({
                         "role": "user",
-                        "content": (
-                            f"Verification failed. Please fix and try again.\n\n{verification}"
-                        ),
+                        "content": self._cognition.build_verification_reflection(verification),
                     })
 
             if resp.stop_reason == "end_turn" and done_result is None:
@@ -361,6 +412,9 @@ class BaseAgent:
         ]
         tool_call_count = 0
         done_result: dict | None = None
+        guardrails = ToolGuardrails()
+        compressed_this_iteration = False
+        api_retries = 0
 
         while True:
             elapsed = time.time() - start
@@ -382,6 +436,10 @@ class BaseAgent:
             if len(messages) > self.COMPACT_AFTER_MESSAGES:
                 messages = self._compact_messages(messages)
 
+            cog_ctx = self._cognition.build_cognitive_context()
+            if cog_ctx:
+                messages[0] = {"role": "system", "content": system_prompt + f"\n\n## Session State\n{cog_ctx}"}
+
             create_kwargs: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
@@ -389,7 +447,6 @@ class BaseAgent:
             if oai_tools:
                 create_kwargs["tools"] = oai_tools
 
-            # OpenRouter: route through Google Vertex, enable reasoning
             if "/" in model:
                 create_kwargs["extra_body"] = {
                     "provider": {
@@ -403,23 +460,39 @@ class BaseAgent:
 
             try:
                 resp = client.chat.completions.create(**create_kwargs)
+                compressed_this_iteration = False
+                api_retries = 0
             except Exception as api_err:
-                err_msg = str(api_err)
-                if "credit balance" in err_msg or "rate_limit" in err_msg:
+                classified = classify_error(api_err)
+                api_retries += 1
+                self._log(f"API error ({classified.category}): {classified.message[:150]}")
+                if api_retries > 5:
                     return AgentResult(
                         success=False,
-                        failure_reason=f"API error: {err_msg[:200]}",
+                        failure_reason=f"API error after {api_retries} retries ({classified.category}): {classified.message[:200]}",
                         duration_s=time.time() - start,
                         tool_call_count=tool_call_count,
                     )
-                raise
+                if classified.should_compress and not compressed_this_iteration:
+                    messages = self._compact_messages(messages)
+                    compressed_this_iteration = True
+                    continue
+                if classified.retryable:
+                    if classified.wait_seconds:
+                        time.sleep(classified.wait_seconds)
+                    continue
+                return AgentResult(
+                    success=False,
+                    failure_reason=f"API error ({classified.category}): {classified.message[:200]}",
+                    duration_s=time.time() - start,
+                    tool_call_count=tool_call_count,
+                )
 
             choice = resp.choices[0]
             msg = choice.message
-            # Preserve the full message including any reasoning content
+            if msg.content:
+                self._cognition.extract_reasoning(msg.content)
             msg_dict = msg.model_dump()
-            # OpenRouter returns reasoning in these fields — preserve them
-            # so the model can reference its own reasoning in subsequent turns
             for reasoning_field in ("reasoning_content", "reasoning"):
                 val = getattr(msg, reasoning_field, None)
                 if val and reasoning_field not in msg_dict:
@@ -429,7 +502,20 @@ class BaseAgent:
             if msg.tool_calls:
                 for tc in msg.tool_calls:
                     tool_call_count += 1
-                    args = json.loads(tc.function.arguments)
+
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError as e:
+                        self._log(f"Malformed JSON in {tc.function.name} args: {e}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": (
+                                f"ERROR: Your tool call had invalid JSON arguments: {e}. "
+                                f"Please retry with valid JSON."
+                            ),
+                        })
+                        continue
 
                     if tc.function.name == "done":
                         done_result = args
@@ -442,11 +528,28 @@ class BaseAgent:
                         result = tool_handler(tc.function.name, args)
                         result_str = result if isinstance(result, str) else json.dumps(result)
                         result_str = _truncate(result_str)
+                        self._cognition.record_tool_call(
+                            tc.function.name, args, result_str[:200],
+                            _looks_like_error(result_str),
+                        )
+                        guardrail_msg = guardrails.check(tc.function.name, args, result_str)
+                        if guardrail_msg:
+                            self._log(f"Guardrail: {guardrail_msg[:100]}")
+                            if guardrail_msg.startswith("BLOCKED:"):
+                                result_str = guardrail_msg
+                            else:
+                                result_str = result_str + "\n\n" + guardrail_msg
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.id,
                             "content": result_str,
                         })
+
+                if self._cognition.should_reflect():
+                    messages.append({
+                        "role": "user",
+                        "content": self._cognition.build_reflection_prompt(),
+                    })
 
                 if done_result is not None:
                     verification = self._verify_done(done_result)
@@ -462,7 +565,7 @@ class BaseAgent:
                         done_result = None
                         messages.append({
                             "role": "user",
-                            "content": f"Verification failed. Please fix and try again.\n\n{verification}",
+                            "content": self._cognition.build_verification_reflection(verification),
                         })
             elif choice.finish_reason == "stop":
                 if msg.content:

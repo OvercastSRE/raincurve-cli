@@ -13,3 +13,4 @@ build/
 .env.*
 .DS_Store
 Thumbs.db
+.claude/hermes-*.md

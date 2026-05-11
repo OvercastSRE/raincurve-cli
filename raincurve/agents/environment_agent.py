@@ -209,132 +209,45 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """\
-You are a production sandbox builder. Your job is to take a codebase and get it \
-running locally in Docker containers — a high-fidelity production replica with \
-minimal resource footprint.
+You are the build agent. Infrastructure is ALREADY SET UP by a prior agent. \
+Your ONLY job: build the app Docker image, start the app container, and verify \
+it responds.
 
-## Your tools
+## What's already done for you
 
-- `bash`: Run shell commands (docker, git, npm, pip, etc.)
-- `text_editor`: Read and edit files (view, create, str_replace)
-- `web_fetch`: Fetch a URL (GitHub README, Docker Hub, docs) to research solutions
-- `web_search`: Search the web for setup guides, Docker images, mock services
-- `done`: Signal completion with service details for verification
+- Docker network `{network_name}` exists
+- Database, cache, and service containers are ALREADY RUNNING (listed in your context)
+- Environment variables for all services are ALREADY PROVIDED (in your context)
+- You do NOT need to start postgres, redis, kafka, or any infrastructure
+- You do NOT need to research or set up mock services
 
-## Approach
+## Your focused mission
 
-1. Read the repo structure and key files (Dockerfile, docker-compose, package.json, \
-   .devcontainer/devcontainer.json, etc.)
-2. Identify ALL external service dependencies (Supabase, Stripe, AWS S3, Firebase, \
-   PostHog, etc.) by scanning env files, imports, and config.
-3. For each external dependency, find the best way to get it working locally. \
-   Use `web_search` and `web_fetch` to research options. You have full autonomy \
-   to decide the best approach for each service — you are the expert.
-4. Prefer EXISTING Dockerfiles and docker-compose files if present. Use them as-is or \
-   with minimal modifications.
-5. If no Dockerfile exists, write one from scratch using multi-stage builds.
-6. BEFORE building, always write a `.dockerignore` if one doesn't exist (see below).
-7. Start all service replacements FIRST (databases, caches, mocked services).
-8. Configure the app's environment to point at these local services.
-9. Build with BuildKit enabled and cache mounts for fast rebuilds.
-10. Run the application container with resource caps.
-11. Run migrations and seed data if applicable.
-12. Verify the app is healthy (curl the health endpoint).
-13. Call `done` with all service details.
+1. Check what's already running: `docker ps --filter "label=rc-aux-of={project_name}"`
+2. Read the Dockerfile (if it exists) or write one
+3. Create `.dockerignore` if missing
+4. Build the Docker image
+5. Start the app container with ALL provided env vars
+6. Wait for startup (at least 120 seconds for migration-heavy apps)
+7. Verify health check passes
+8. Call `done`
 
-## External service replacement (CRITICAL)
+## Error recovery (CRITICAL)
 
-When an app depends on external services, you MUST provide functional local \
-replacements — not skip them. The goal is a working production replica.
+When a Docker build fails:
+1. READ the error output — the last 20 lines contain the cause
+2. DIAGNOSE — is it a missing file, wrong base image, missing dependency?
+3. EDIT the Dockerfile to fix the specific issue
+4. THEN retry the build
 
-YOU HAVE FULL PERMISSION TO MODIFY THE APPLICATION SOURCE CODE to make services \
-work locally. This is a sandbox — not production. Do whatever it takes to get the \
-app running. Examples of acceptable code changes:
-- Modify config files to point at local services
-- Edit environment loading code to accept local URLs
-- Add conditional logic to use local auth instead of a third-party provider
-- Swap out SDK client initialization to point at local endpoints
-- Disable SSL/TLS verification for local services
-- Comment out or bypass service health checks that call external APIs
-- Modify middleware to skip external auth validation in dev mode
-- Change import paths or add adapter code for local service replacements
-- Edit docker-compose files, Dockerfiles, or build configs
-- Create wrapper scripts or config patches
+NEVER retry a build without changing something. If the same Dockerfile fails \
+twice, you MUST edit it before trying again. Changing Docker flags (--no-cache, \
+--buildx, etc.) does NOT fix Dockerfile bugs.
 
-Record every file you modify in your `done` call under `modifications`.
+## Code modifications
 
-### Strategy for each service type
-
-Use your judgment. Here is general guidance:
-
-**Services with official local/mock Docker images** (preferred):
-- Stripe → `stripe/stripe-mock`, Supabase → `supabase/postgres` + GoTrue + PostgREST, \
-  Firebase → official emulator suite, AWS S3 → MinIO, AWS services → LocalStack, \
-  Redis → `redis:7-alpine`, Postgres/MySQL/Mongo → official Docker images.
-- Use `web_search` to find the right image and setup for anything you're unsure about.
-
-**Auth providers** (Clerk, Auth0, Okta, Google OAuth, AWS Cognito):
-- If there's an official mock/emulator, use it.
-- Otherwise, MODIFY THE CODE to bypass the auth provider in dev mode. For example: \
-  create a mock auth middleware that returns a hardcoded user, or swap the auth \
-  client config to point at a generic OAuth mock like `mock-oauth2-server`.
-- The key insight: the sandbox user doesn't need real auth — they need the app to \
-  be functional. A hardcoded dev user is better than a broken auth flow.
-
-**SaaS analytics/monitoring** (PostHog, Sentry, Datadog, LaunchDarkly):
-- Disable via environment variables. Most of these SDKs have a "disable" flag.
-- If not, modify the initialization code to no-op in dev mode.
-
-**Email services** (SendGrid, Resend, Mailgun, SES, Postmark):
-- Use Mailpit (`axllent/mailpit`) — it captures all outgoing email with a web UI.
-- Change the app's SMTP config to point at Mailpit.
-
-**Message brokers** (RabbitMQ, Kafka, SQS):
-- Run the real service in Docker — these all have lightweight official images.
-
-**Search services** (Algolia, Elasticsearch, Meilisearch):
-- Run the real engine in Docker. For Algolia, swap to Meilisearch and modify \
-  the client initialization code.
-
-**Vector databases** (Pinecone, Weaviate, Qdrant):
-- Run the real engine in Docker (all have official images).
-- Modify the client config to point at the local instance.
-
-**Payments** (Stripe, PayPal, Lemon Squeezy):
-- Use official mock servers where available. For others, modify the code to use \
-  test/sandbox mode with dummy credentials.
-
-**General principle**: prefer running real services or official mocks. When that's \
-not possible, MODIFY THE CODE to make it work. A working sandbox with code changes \
-is infinitely better than a broken sandbox with pristine code. Always use Docker \
-network hostnames (e.g., `http://myapp-postgres:5432`) not localhost.
-
-## Wiring external services (CRITICAL — env vars are NOT enough)
-
-For database services (Postgres, Redis, MongoDB), env var wiring works — apps \
-universally read DATABASE_URL/REDIS_URL from environment variables. Set the env \
-var to the Docker network hostname and you're done.
-
-For HTTP API services (Stripe, SendGrid, Twilio, OpenAI, Auth0, etc.), setting \
-env vars like STRIPE_SECRET_KEY=sk_test_fake is NOT sufficient. The SDK client \
-still calls the real API endpoint (api.stripe.com). You MUST also patch the code:
-
-1. Start the mock container (use the pre-baked recipe command if provided)
-2. Find where the SDK client is initialized in the app code
-3. Modify the initialization code INSIDE THE DOCKER CONTAINER to override the \
-   base URL to point at the mock container on the Docker network
-4. Restart the app process if needed
-
-Examples of SDK patching (do this INSIDE the container via docker exec + sed, \
-or by editing the file before building):
-- Node.js Stripe: Add `apiVersion` and point to mock:
-  const stripe = new Stripe(key, {{ host: '{{container}}-stripe', port: 12111, protocol: 'http' }})
-- Python Stripe: stripe.api_base = "http://{{container}}-stripe:12111"
-- Node.js SendGrid: Override the base URL in the client config
-- Python OpenAI: client = OpenAI(base_url="http://{{container}}-openai:3000/v1")
-- Any SDK: Look for environment variables the SDK respects for base URL override \
-  (e.g., OPENAI_BASE_URL, STRIPE_API_BASE). Set those FIRST, and if the app \
-  doesn't use them, patch the code.
+You have FULL PERMISSION to modify application source code inside the container \
+to make services work locally. This is a sandbox — not production.
 
 All modifications happen inside the container or in the Dockerfile/build. \
 NEVER modify files on the user's host machine directly. \
@@ -344,83 +257,10 @@ Record every modification in your `done` call under `modifications`.
 
 - Network name: `{network_name}`
 - App container: `{container_name}`
-- Aux containers: use descriptive names like `{container_name}-postgres`, \
-  `{container_name}-redis`
-- Label all aux containers with: `--label rc-aux-of={project_name}`
-- Always set `--restart=unless-stopped` on all containers
-- Always set resource limits: `--memory` and `--cpus`
-
-## Resource limits
-
-- Stateless app containers: `--memory=512m --cpus=0.5`
-- Databases (postgres, mysql): `--memory=256m --cpus=0.5`
-- Caches (redis, memcached): `--memory=64m --cpus=0.25`
-- Workers/queues: `--memory=256m --cpus=0.25`
-- Never exceed `--memory=2g` on any single container
-- Total sandbox budget: ~2GB RAM. Be stingy.
-
-## Dev-optimized auxiliary services (CRITICAL)
-
-These configs give production-equivalent BEHAVIOR with 1/10th the resources. \
-The app cannot tell the difference.
-
-PostgreSQL — ALWAYS use these flags:
-```
-docker run -d --name {{container_name}}-postgres \
-  --network {{network_name}} \
-  --label rc-aux-of={{project_name}} \
-  --restart unless-stopped \
-  --memory=256m --cpus=0.5 \
-  --shm-size=64m \
-  -e POSTGRES_DB=app -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
-  postgres:16-alpine \
-  -c shared_buffers=32MB \
-  -c work_mem=4MB \
-  -c maintenance_work_mem=16MB \
-  -c effective_cache_size=128MB \
-  -c max_connections=20 \
-  -c wal_level=minimal \
-  -c max_wal_senders=0 \
-  -c fsync=off \
-  -c synchronous_commit=off \
-  -c full_page_writes=off \
-  -c checkpoint_timeout=30min \
-  -c max_wal_size=256MB
-```
-
-MySQL — ALWAYS use these flags:
-```
-docker run -d --name {{container_name}}-mysql \
-  --memory=256m --cpus=0.5 \
-  mysql:8.0 \
-  --innodb-buffer-pool-size=32M \
-  --innodb-log-file-size=16M \
-  --innodb-flush-log-at-trx-commit=0 \
-  --innodb-flush-method=nosync \
-  --max-connections=20 \
-  --performance-schema=OFF \
-  --skip-log-bin
-```
-
-Redis — ALWAYS use these flags:
-```
-docker run -d --name {{container_name}}-redis \
-  --memory=64m --cpus=0.25 \
-  redis:7-alpine \
-  --maxmemory 32mb \
-  --maxmemory-policy allkeys-lru \
-  --save "" \
-  --appendonly no
-```
-
-MongoDB:
-```
-docker run -d --name {{container_name}}-mongo \
-  --memory=256m --cpus=0.5 \
-  mongo:7 \
-  --wiredTigerCacheSizeGB 0.1 \
-  --nojournal
-```
+- Label: `--label rc-aux-of={project_name}`
+- Always set `--restart=unless-stopped`, `--memory`, `--cpus`
+- App container: `--memory=1024m --cpus=1.0`
+- Do NOT start infrastructure containers (postgres, redis, etc.) — they are already running
 
 ## .dockerignore (ALWAYS create before building)
 
@@ -583,38 +423,14 @@ Steps:
 Only build from source if there is NO pre-built image in the compose file, or \
 the compose file uses `build:` instead of `image:`.
 
-## Before calling done — STRICT verification (MANDATORY)
+## Before calling done — verification
 
-You CANNOT call done until you have run ALL of these checks and they pass. \
-If any check fails, you must fix the issue and re-run the check.
+1. **Health check**: `curl -sf http://localhost:{{port}}/healthz` (or the app's health endpoint)
+2. **Database check**: If the app uses a database, confirm tables exist
+3. **Logs check**: `docker logs {container_name} --tail 20` — no crash loops
 
-### 1. DATABASE CHECK
-If the app uses a database, query it to confirm the schema is loaded:
-  docker exec {{container_name}}-postgres psql -U postgres -d app -c "\\dt"
-This must show application tables (users, posts, etc.), not just system tables. \
-If no tables exist, run migrations first.
-
-### 2. MOCK SERVICE CHECKS
-For EACH mock service you started, verify it responds. Run the check FROM \
-the app container (to prove network connectivity):
-  docker exec {{container_name}} curl -sf http://{{container_name}}-stripe:12111/v1/charges
-  docker exec {{container_name}} curl -sf http://{{container_name}}-redis:6379 || docker exec {{container_name}}-redis redis-cli ping
-Each must return a valid response. If a mock is unreachable, check the Docker \
-network and container names.
-
-### 3. END-TO-END API TEST
-Make at least one real API call that exercises the full stack:
-  curl -X POST http://127.0.0.1:{{port}}/api/users -H "Content-Type: application/json" -d '{{"name":"test"}}'
-This should hit the app, which touches the database and ideally a mock service. \
-A successful response (2xx or 3xx) with a valid body proves the system works. \
-If the app has auth, try hitting a public endpoint or the health/status endpoint \
-with query params that trigger database access.
-
-### 4. REPORT RESULTS
-Include ALL verification results in your `done` call under `verification`:
-- db_check: the command you ran, tables found, success boolean
-- mock_checks: array of {{service, url_tested, status, success}} for each mock
-- api_test: the endpoint, method, status, response snippet, success boolean
+Include verification results in your `done` call. If health check passes and \
+the app is not crash-looping, you are done. Do NOT write elaborate test scripts.
 
 ## Important
 
@@ -663,6 +479,8 @@ class EnvironmentAgent(BaseAgent):
         self.pre_started_services = pre_started_services or set()
         self.pipe_handled_services = pipe_handled_services or set()
         self.retry_context = retry_context
+        self._build_failures: dict[str, int] = {}
+        self._last_build_error: str = ""
 
     def _build_brief_message(self) -> str:
         """Build a targeted user message from the pre-analysis brief."""
@@ -858,10 +676,94 @@ class EnvironmentAgent(BaseAgent):
                 for k, v in self.env_overrides.items():
                     user_msg += f"  {k}={v}\n"
 
+        if self.pre_started_services:
+            user_msg += (
+                "\n## Infrastructure already running (set up by infra agent)\n\n"
+                "These containers are ALREADY RUNNING on the Docker network. "
+                "Do NOT recreate them. Just use them via their container hostnames.\n"
+            )
+            for svc in sorted(self.pre_started_services):
+                user_msg += f"  - {self.container_name}-{svc}\n"
+            user_msg += (
+                "\nThe env vars for these services are already in your env_overrides above. "
+                "Focus on building and running the APPLICATION container only.\n"
+            )
+
+        past_skill = self._load_build_skill()
+        if past_skill:
+            user_msg += (
+                "\n## Past build skill (from a previous successful build of this stack)\n\n"
+                f"{past_skill}\n\n"
+                "Use this as a starting point. Adapt as needed for this specific project."
+            )
+
         if self.retry_context:
             user_msg += "\n" + self.retry_context
 
-        return self._run_loop(system, user_msg, TOOLS, self._handle_tool)
+        result = self._run_loop(system, user_msg, TOOLS, self._handle_tool)
+        self._save_build_trajectory(result)
+        return result
+
+    def _load_build_skill(self) -> str | None:
+        """Load a past successful build pattern for this stack."""
+        b = self.repo_brief
+        if not b:
+            return None
+        stack_key = f"{b.language or 'unknown'}_{b.framework or 'unknown'}".lower()
+        skill_dir = Path.home() / ".raincurve" / "skills"
+        skill_file = skill_dir / f"{stack_key}.md"
+        if skill_file.exists():
+            try:
+                content = skill_file.read_text(encoding="utf-8", errors="replace")
+                return content[:3000]
+            except (PermissionError, OSError):
+                pass
+        return None
+
+    def _save_build_trajectory(self, result: AgentResult) -> None:
+        """Save build outcome as a skill for future runs (Hermes learning loop)."""
+        if not result.output:
+            return
+        b = self.repo_brief
+        if not b:
+            return
+
+        stack_key = f"{b.language or 'unknown'}_{b.framework or 'unknown'}".lower()
+        skill_dir = Path.home() / ".raincurve" / "skills"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_file = skill_dir / f"{stack_key}.md"
+
+        output = result.output
+        lines = [
+            f"# Build skill: {stack_key}",
+            f"Success: {result.success}",
+            f"Duration: {result.duration_s:.0f}s, Calls: {result.tool_call_count}",
+        ]
+
+        if result.success:
+            lines.append(f"Port: {output.get('port', '?')}")
+            if output.get("services"):
+                lines.append("Services:")
+                for svc in output["services"]:
+                    lines.append(f"  - {svc.get('name', '?')}: {svc.get('image', '?')}")
+            if output.get("modifications"):
+                lines.append("Modifications:")
+                for mod in output["modifications"]:
+                    lines.append(f"  - {mod}")
+            if output.get("env_vars_used"):
+                critical_vars = {k: v for k, v in output["env_vars_used"].items()
+                                 if any(s in k.upper() for s in ("DATABASE", "REDIS", "PORT", "URL", "SECRET"))}
+                if critical_vars:
+                    lines.append("Key env vars:")
+                    for k, v in list(critical_vars.items())[:15]:
+                        lines.append(f"  {k}={v}")
+        else:
+            lines.append(f"Failure: {result.failure_reason or 'unknown'}")
+
+        try:
+            skill_file.write_text("\n".join(lines), encoding="utf-8")
+        except (PermissionError, OSError):
+            pass
 
     def _handle_tool(self, name: str, args: dict) -> str:
         if name == "bash":
@@ -910,6 +812,16 @@ class EnvironmentAgent(BaseAgent):
                     f"'docker logs --tail 50 <name>', or poll with a timeout."
                 )
 
+        # Guard: don't recreate containers the infra agent already started
+        container_guard = self._guard_docker_run(cmd)
+        if container_guard:
+            return container_guard
+
+        # Guard: don't retry same broken Dockerfile
+        build_guard = self._guard_docker_build(cmd)
+        if build_guard:
+            return build_guard
+
         if cwd:
             full_cwd = str(Path(self.project_dir) / cwd)
         else:
@@ -927,7 +839,92 @@ class EnvironmentAgent(BaseAgent):
         if not output:
             output = "(no output)"
 
-        return f"exit_code={result.exit_code}\n{output}"
+        raw = f"exit_code={result.exit_code}\n{output}"
+
+        # Post-process: if docker build failed, classify and track
+        if "docker build" in cmd_lower and result.exit_code != 0:
+            raw = self._diagnose_build_failure(cmd, raw)
+
+        return raw
+
+    def _guard_docker_run(self, cmd: str) -> str | None:
+        """Prevent recreating containers that already exist and are healthy."""
+        import re as _re
+        match = _re.search(r"docker\s+run\s+.*--name\s+(\S+)", cmd)
+        if not match:
+            return None
+        name = match.group(1)
+
+        check = _exec_bash(
+            f'docker ps --filter "name=^{name}$" --format "{{{{.Status}}}}"',
+            self.project_dir, 5,
+        )
+        if check.ok and check.stdout.strip() and "Up" in check.stdout:
+            return (
+                f"SKIPPED: Container '{name}' is already running. "
+                f"Status: {check.stdout.strip()}. "
+                f"Use it as-is — do NOT recreate infrastructure containers."
+            )
+        return None
+
+    def _guard_docker_build(self, cmd: str) -> str | None:
+        """Block repeated builds of the same broken Dockerfile."""
+        if "docker build" not in cmd.lower():
+            return None
+
+        dockerfile_path = Path(self.project_dir) / "Dockerfile"
+        if not dockerfile_path.exists():
+            return None
+
+        import hashlib
+        content = dockerfile_path.read_text(encoding="utf-8", errors="replace")
+        h = hashlib.md5(content.encode()).hexdigest()[:12]
+
+        fails = self._build_failures.get(h, 0)
+        if fails >= 2:
+            return (
+                f"BLOCKED: This exact Dockerfile has failed {fails} times. "
+                f"You MUST edit the Dockerfile before trying again. "
+                f"Last error:\n{self._last_build_error[:1000]}"
+            )
+        return None
+
+    def _diagnose_build_failure(self, cmd: str, raw_output: str) -> str:
+        """Classify a docker build failure and track it."""
+        dockerfile_path = Path(self.project_dir) / "Dockerfile"
+        if dockerfile_path.exists():
+            import hashlib
+            content = dockerfile_path.read_text(encoding="utf-8", errors="replace")
+            h = hashlib.md5(content.encode()).hexdigest()[:12]
+            self._build_failures[h] = self._build_failures.get(h, 0) + 1
+
+        error_tail = raw_output[-2000:]
+        self._last_build_error = error_tail
+
+        diagnosis = "\n\n--- BUILD FAILURE DIAGNOSIS ---\n"
+        lower = error_tail.lower()
+        if "no such file or directory" in lower:
+            diagnosis += "CAUSE: Missing file. Check paths in COPY/ADD commands.\n"
+        elif "not found" in lower and ("npm" in lower or "pnpm" in lower or "yarn" in lower):
+            diagnosis += "CAUSE: Package manager not found. Check base image has it installed.\n"
+        elif "enoent" in lower or "module not found" in lower:
+            diagnosis += "CAUSE: Missing dependency. Check package.json and install command.\n"
+        elif "permission denied" in lower:
+            diagnosis += "CAUSE: Permission issue. Check file ownership and USER directive.\n"
+        elif "no space left" in lower:
+            diagnosis += "CAUSE: Disk full. Run `docker system prune -f` first.\n"
+        elif "syntax error" in lower or "unexpected token" in lower:
+            diagnosis += "CAUSE: Syntax error in Dockerfile or build script.\n"
+        elif "failed to solve" in lower or "failed to compute" in lower:
+            diagnosis += "CAUSE: BuildKit resolver error. Check FROM image and COPY sources.\n"
+        else:
+            diagnosis += "CAUSE: Unknown. Read the error output above carefully.\n"
+
+        diagnosis += (
+            "ACTION REQUIRED: Read the error, edit the Dockerfile to fix it, "
+            "then retry. Do NOT retry with the same Dockerfile."
+        )
+        return raw_output + diagnosis
 
     def _handle_text_editor(self, args: dict) -> str:
         command = args["command"]
@@ -1132,40 +1129,8 @@ class EnvironmentAgent(BaseAgent):
                 "Query the database and list the tables."
             )
 
-        # 3. Validate mock checks
-        mock_checks = verification.get("mock_checks", [])
-        # Check required services are in the mock_checks
-        if self.detection_result:
-            from raincurve.services.recipes import DISABLEABLE_SERVICES, get_recipe
-            for svc in self.detection_result.detected_services:
-                if svc.name not in DISABLEABLE_SERVICES:
-                    recipe = get_recipe(svc.name)
-                    if recipe:
-                        checked = any(
-                            m.get("service", "").lower() == svc.name.lower()
-                            for m in mock_checks
-                        )
-                        if not checked:
-                            failures.append(
-                                f"MOCK CHECK MISSING for {svc.name}: "
-                                f"You must curl the {svc.name} mock service and include the result."
-                            )
-
-        for mc in mock_checks:
-            if not mc.get("success"):
-                failures.append(
-                    f"MOCK CHECK FAILED for {mc.get('service', '?')}: "
-                    f"URL {mc.get('url_tested', '?')} did not respond. "
-                    f"Check that the container is running and on the correct network."
-                )
-
-        # 4. Validate API test
-        api_test = verification.get("api_test", {})
-        if not api_test.get("success"):
-            failures.append(
-                "END-TO-END API TEST FAILED: The API test did not succeed. "
-                "Try a different endpoint or fix the issue that caused the failure."
-            )
+        # 3. Mock checks removed — infra agent handles services.
+        # Build agent only needs to verify the app itself is running.
 
         if failures:
             # Gather container logs for diagnostics

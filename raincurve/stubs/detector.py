@@ -538,6 +538,12 @@ def detect_external_services(project_dir: str | Path) -> DetectionResult:
 
 def _walk_source_files(root: Path):
     for path in root.rglob("*"):
-        if path.is_file() and path.suffix in SCAN_EXTENSIONS:
-            if not any(skip in path.parts for skip in SKIP_DIRS):
+        if any(skip in path.parts for skip in SKIP_DIRS):
+            continue
+        if path.suffix not in SCAN_EXTENSIONS:
+            continue
+        try:
+            if path.is_file():
                 yield path
+        except OSError:
+            continue

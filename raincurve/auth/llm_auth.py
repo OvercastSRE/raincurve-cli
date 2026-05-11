@@ -26,7 +26,7 @@ DEFAULT_MODELS = {
     "openrouter": "moonshotai/kimi-k2.5",
 }
 
-OPENROUTER_DEFAULT_KEY = "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"
+OPENROUTER_DEFAULT_KEY = os.environ.get("RAINCURVE_OPENROUTER_KEY", "")
 
 
 def init_llm() -> bool:

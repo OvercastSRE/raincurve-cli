@@ -44,11 +44,19 @@ def scan_file_tree(root: str | Path, max_depth: int = MAX_TREE_DEPTH) -> str:
             return
         try:
             entries = sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
-        except PermissionError:
+        except (PermissionError, OSError):
             return
 
-        dirs = [e for e in entries if e.is_dir() and e.name not in SKIP_DIRS and not e.name.startswith(".")]
-        files = [e for e in entries if e.is_file()]
+        dirs = []
+        files = []
+        for e in entries:
+            try:
+                if e.is_dir() and e.name not in SKIP_DIRS and not e.name.startswith("."):
+                    dirs.append(e)
+                elif e.is_file():
+                    files.append(e)
+            except OSError:
+                continue
 
         for f in files:
             lines.append(f"{prefix}{f.name}")
@@ -64,11 +72,16 @@ def find_key_files(root: str | Path) -> dict[str, str]:
     root = Path(root)
     found: dict[str, str] = {}
 
-    # Check root level and one level deep for key files
     search_dirs = [root]
-    for child in root.iterdir():
-        if child.is_dir() and child.name not in SKIP_DIRS and not child.name.startswith("."):
-            search_dirs.append(child)
+    try:
+        for child in root.iterdir():
+            try:
+                if child.is_dir() and child.name not in SKIP_DIRS and not child.name.startswith("."):
+                    search_dirs.append(child)
+            except OSError:
+                continue
+    except OSError:
+        pass
 
     for search_dir in search_dirs:
         for name in KEY_FILES:
@@ -83,23 +96,39 @@ def find_key_files(root: str | Path) -> dict[str, str]:
                         pass
 
     _skip_prefixes = {".cursor", ".devcontainer", ".github", ".vscode", ".idea"}
-    for dockerfile in root.rglob("Dockerfile*"):
-        rel = str(dockerfile.relative_to(root))
-        first_part = Path(rel).parts[0] if Path(rel).parts else ""
-        if rel not in found and not any(skip in rel for skip in SKIP_DIRS) and first_part not in _skip_prefixes:
+    try:
+        for dockerfile in root.rglob("Dockerfile*"):
             try:
-                found[rel] = dockerfile.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_READ_BYTES]
-            except (PermissionError, OSError):
-                pass
-
-    for pattern in ["docker-compose*.yml", "docker-compose*.yaml", "compose*.yml", "compose*.yaml"]:
-        for compose in root.rglob(pattern):
-            rel = str(compose.relative_to(root))
-            if rel not in found and not any(skip in rel for skip in SKIP_DIRS):
+                if not dockerfile.is_file():
+                    continue
+            except OSError:
+                continue
+            rel = str(dockerfile.relative_to(root))
+            first_part = Path(rel).parts[0] if Path(rel).parts else ""
+            if rel not in found and not any(skip in rel for skip in SKIP_DIRS) and first_part not in _skip_prefixes:
                 try:
-                    found[rel] = compose.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_READ_BYTES]
+                    found[rel] = dockerfile.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_READ_BYTES]
                 except (PermissionError, OSError):
                     pass
+    except OSError:
+        pass
+
+    for pattern in ["docker-compose*.yml", "docker-compose*.yaml", "compose*.yml", "compose*.yaml"]:
+        try:
+            for compose in root.rglob(pattern):
+                try:
+                    if not compose.is_file():
+                        continue
+                except OSError:
+                    continue
+                rel = str(compose.relative_to(root))
+                if rel not in found and not any(skip in rel for skip in SKIP_DIRS):
+                    try:
+                        found[rel] = compose.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_READ_BYTES]
+                    except (PermissionError, OSError):
+                        pass
+        except OSError:
+            pass
 
     return found
 

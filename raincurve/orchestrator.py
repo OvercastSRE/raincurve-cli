@@ -14,6 +14,7 @@ from raincurve.agents.recovery_agent import RecoveryAgent
 from raincurve.agents.seeder_agent import SeederAgent
 from raincurve.agents.e2e_agent import E2EAgent
 from raincurve.config import load_global_config
+from raincurve.context.shared import SharedContext
 from raincurve.models.code_context import (
     CodeContext,
     DatabaseInfo,
@@ -82,6 +83,7 @@ class SandboxOrchestrator:
         self.repo_brief = repo_brief
         self.on_log = on_log
         self.pipe_server: PipeServer | None = None
+        self.shared = SharedContext(project_dir)
         self._total_tool_calls = 0
 
     # ------------------------------------------------------------------
@@ -101,32 +103,42 @@ class SandboxOrchestrator:
             code_context = self._run_code_analysis(docs)
             self._persist_code_context(code_context)
 
+            # Inject user's LLM keys into env_overrides for the target app
+            self._inject_llm_keys()
+
+            # Seed shared context with analysis + env vars
+            self._seed_shared_context(code_context)
+
             # Start Pipe server (Python — raincurve infra, always available)
             self._start_pipe()
 
-            # Step 3: Infrastructure + external services (LLM agent)
-            self.on_log("\n[Step 3] Resolving external services and infrastructure...")
+            # Step 2: Infrastructure (single agent — Hermes pattern)
+            self.on_log("\n[Step 2] Setting up infrastructure...")
             infra_result = self._run_infra(code_context)
             if infra_result.success and infra_result.output:
                 self.env_overrides.update(infra_result.output.get("env_vars_for_app", {}))
+                self._infra_services = {
+                    s.get("name", "") for s in infra_result.output.get("services", [])
+                    if s.get("status") in ("running", "pipe", "disabled")
+                }
 
-            # Step 4: Build and run app (LLM agent)
-            self.on_log("\n[Step 4] Building application...")
+            # Step 3: Build and run app (LLM agent)
+            self.on_log("\n[Step 3] Building application...")
             build_result = self._run_build(code_context)
 
             output = build_result.output or {}
             port = output.get("port")
 
-            # Step 5: Seed data (LLM agent)
+            # Step 4: Seed data (LLM agent)
             seed_summary: dict = {}
             if port:
-                self.on_log("\n[Step 5] Seeding data...")
+                self.on_log("\n[Step 4] Seeding data...")
                 seed_summary = self._run_seeding(code_context, output)
 
-            # Step 6: E2E smoke test (LLM agent)
+            # Step 5: E2E smoke test (LLM agent)
             e2e_summary: dict = {}
             if port:
-                self.on_log("\n[Step 6] Running E2E smoke tests...")
+                self.on_log("\n[Step 5] Running E2E smoke tests...")
                 e2e_summary = self._run_e2e(code_context, output)
 
             return SandboxResult(
@@ -243,6 +255,106 @@ class SandboxOrchestrator:
         return self._build_fallback_code_context(docs)
 
     # ------------------------------------------------------------------
+    # Shared context seeding
+    # ------------------------------------------------------------------
+
+    def _seed_shared_context(self, ctx: CodeContext) -> None:
+        """Write analysis results to shared context so service agents can read it."""
+        parts = [
+            f"# Code Analysis — {ctx.project_name}",
+            f"Language: {ctx.language}",
+            f"Framework: {ctx.framework or 'unknown'}",
+            f"Package manager: {ctx.package_manager or 'unknown'}",
+        ]
+        if ctx.app_description:
+            parts.append(f"Description: {ctx.app_description}")
+        if ctx.database:
+            parts.append(f"\n## Database")
+            parts.append(f"Type: {ctx.database.db_type}")
+            if ctx.database.connection_env_var:
+                parts.append(f"Connection env var: {ctx.database.connection_env_var}")
+            if ctx.database.migration_command:
+                parts.append(f"Migration: {ctx.database.migration_command}")
+            if ctx.database.schema_summary:
+                parts.append(f"Schema: {ctx.database.schema_summary}")
+        if ctx.sdk_usages:
+            parts.append(f"\n## Detected services")
+            for sdk in ctx.sdk_usages:
+                parts.append(
+                    f"- {sdk.service_name}: package={sdk.sdk_package}, "
+                    f"init={sdk.init_file}, files={sdk.files_using_sdk}"
+                )
+        if ctx.env_vars:
+            parts.append(f"\n## Environment variables")
+            for ev in ctx.env_vars:
+                parts.append(f"- {ev.name}: {ev.purpose or '(no description)'}")
+        if ctx.start_command:
+            parts.append(f"\nStart command: {ctx.start_command}")
+        if ctx.build_command:
+            parts.append(f"Build command: {ctx.build_command}")
+        if ctx.dockerfile_path:
+            parts.append(f"Dockerfile: {ctx.dockerfile_path}")
+        if ctx.compose_path:
+            parts.append(f"Compose: {ctx.compose_path}")
+
+        self.shared.write("analysis.md", "\n".join(parts))
+
+        if self.env_overrides:
+            import json
+            self.shared.write("env_vars.json", json.dumps(self.env_overrides, indent=2))
+
+        self.shared.write(
+            "infra.md",
+            f"# Infrastructure\n"
+            f"App container: {self.container_name}\n"
+            f"Network: {self.network_name}\n"
+            f"Container prefix: {self.container_name}\n"
+            f"Project: {self.project_name}\n",
+        )
+        self.on_log("  Seeded shared context for service agents")
+
+    # (Parallel service agents removed — single InfraAgent handles everything)
+
+    # ------------------------------------------------------------------
+    # LLM key injection
+    # ------------------------------------------------------------------
+
+    def _inject_llm_keys(self) -> None:
+        """Read the user's LLM keys from global config and inject them into
+        env_overrides so the target app can use them."""
+        cfg = load_global_config()
+        llm = cfg.llm
+
+        if llm.openrouter_api_key:
+            self.env_overrides.setdefault("OPENROUTER_API_KEY", llm.openrouter_api_key)
+            self.env_overrides.setdefault("OPENAI_API_KEY", llm.openrouter_api_key)
+            self.env_overrides.setdefault("OPENAI_BASE_URL", OPENROUTER_BASE_URL)
+            self.on_log("  Injected OpenRouter key (also as OpenAI-compatible fallback)")
+
+        if llm.api_key:
+            provider = (llm.provider or "").lower()
+            if provider == "anthropic":
+                self.env_overrides.setdefault("ANTHROPIC_API_KEY", llm.api_key)
+                self.on_log("  Injected Anthropic API key")
+            elif provider == "openai":
+                self.env_overrides.setdefault("OPENAI_API_KEY", llm.api_key)
+                self.on_log("  Injected OpenAI API key")
+            else:
+                self.env_overrides.setdefault("ANTHROPIC_API_KEY", llm.api_key)
+                self.env_overrides.setdefault("OPENAI_API_KEY", llm.api_key)
+                self.on_log(f"  Injected LLM API key (provider: {provider or 'unknown'})")
+
+        env_key = os.environ.get("ANTHROPIC_API_KEY")
+        if env_key:
+            self.env_overrides.setdefault("ANTHROPIC_API_KEY", env_key)
+        env_key = os.environ.get("OPENAI_API_KEY")
+        if env_key:
+            self.env_overrides.setdefault("OPENAI_API_KEY", env_key)
+        env_key = os.environ.get("OPENROUTER_API_KEY")
+        if env_key:
+            self.env_overrides.setdefault("OPENROUTER_API_KEY", env_key)
+
+    # ------------------------------------------------------------------
     # Pipe startup
     # ------------------------------------------------------------------
 
@@ -274,7 +386,6 @@ class SandboxOrchestrator:
     # ------------------------------------------------------------------
 
     def _run_infra(self, ctx: CodeContext) -> AgentResult:
-        # Build context summary for the agent
         summary_parts = [
             f"Language: {ctx.language}",
             f"Framework: {ctx.framework or 'unknown'}",
@@ -295,7 +406,6 @@ class SandboxOrchestrator:
                     f"strategy: {sdk.patching_strategy}"
                 )
 
-        # Build recipes reference
         recipes_parts = []
         if self.detection_result:
             for svc in self.detection_result.detected_services:
@@ -311,27 +421,20 @@ class SandboxOrchestrator:
                         wiring = ", ".join(f"{k}={v}" for k, v in recipe.env_wiring.items())
                         recipes_parts.append(f"App env vars: {wiring}")
 
-        # Pipe info
         pipe_port = self.pipe_server.port if self.pipe_server else 19877
         pipe_info = (
             f"Pipe (LLM-backed API mock) is running on host port {pipe_port}. "
             f"From inside Docker containers, it's at http://host.docker.internal:{pipe_port}. "
-            f"For any HTTP API service (Stripe, Twilio, SendGrid, Resend, etc.), you can "
-            f"point the SDK's base URL at Pipe instead of starting a mock container. "
+            f"For any HTTP API service (Stripe, Twilio, SendGrid, Resend, etc.), point "
+            f"the SDK's base URL at Pipe instead of starting a container. "
             f"Example: STRIPE_API_BASE=http://host.docker.internal:{pipe_port}/stripe"
         )
 
-        # Disableable services
-        disabled = []
+        disabled_parts = []
         if self.detection_result:
             for svc in self.detection_result.detected_services:
                 if svc.name in DISABLEABLE_SERVICES:
-                    disabled.append(f"- {svc.name} (disable via env var)")
-
-        already_text = pipe_info
-        if disabled:
-            already_text += "\n\nDisableable services (analytics/monitoring — just disable):\n"
-            already_text += "\n".join(disabled)
+                    disabled_parts.append(f"- {svc.name} (disable via env var)")
 
         agent = InfraAgent(
             project_dir=self.project_dir,
@@ -340,7 +443,8 @@ class SandboxOrchestrator:
             network_name=self.network_name,
             code_context_summary="\n".join(summary_parts),
             recipes_text="\n".join(recipes_parts) if recipes_parts else "(no recipes)",
-            already_handled=already_text,
+            pipe_info=pipe_info,
+            disabled_services="\n".join(disabled_parts) if disabled_parts else "(none)",
             on_log=lambda m: self.on_log(f"  {m}"),
         )
 
@@ -363,6 +467,10 @@ class SandboxOrchestrator:
     # ------------------------------------------------------------------
 
     def _run_build(self, ctx: CodeContext) -> AgentResult:
+        infra_services = set()
+        if hasattr(self, '_infra_services'):
+            infra_services = self._infra_services
+
         for attempt in range(3):
             agent = EnvironmentAgent(
                 project_dir=self.project_dir,
@@ -373,7 +481,7 @@ class SandboxOrchestrator:
                 detection_result=self.detection_result,
                 repo_brief=self.repo_brief,
                 on_log=lambda m: self.on_log(f"  {m}"),
-                pre_started_services=set(),
+                pre_started_services=infra_services,
                 pipe_handled_services=set(),
             )
 
