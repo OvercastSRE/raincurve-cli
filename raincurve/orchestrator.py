@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -10,6 +12,7 @@ from raincurve.agents.base_agent import AgentResult, OPENROUTER_BASE_URL, OPENRO
 from raincurve.agents.code_analysis_agent import CodeAnalysisAgent
 from raincurve.agents.environment_agent import EnvironmentAgent
 from raincurve.agents.infra_agent import InfraAgent
+from raincurve.agents.overseer_agent import OverseerAgent
 from raincurve.agents.recovery_agent import RecoveryAgent
 from raincurve.agents.seeder_agent import SeederAgent
 from raincurve.agents.e2e_agent import E2EAgent
@@ -85,6 +88,15 @@ class SandboxOrchestrator:
         self.pipe_server: PipeServer | None = None
         self.shared = SharedContext(project_dir)
         self._total_tool_calls = 0
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Thread-safe helpers
+    # ------------------------------------------------------------------
+
+    def _record_tool_calls(self, count: int) -> None:
+        with self._lock:
+            self._total_tool_calls += count
 
     # ------------------------------------------------------------------
     # Main pipeline
@@ -98,23 +110,18 @@ class SandboxOrchestrator:
             self.on_log("[Step 0] Reading project documentation...")
             docs = self._read_project_docs()
 
-            # Step 1: Deep code analysis (LLM agent)
-            self.on_log("\n[Step 1] Analyzing codebase...")
-            code_context = self._run_code_analysis(docs)
-            self._persist_code_context(code_context)
-
-            # Inject user's LLM keys into env_overrides for the target app
+            # Pre-work (instant): inject LLM keys and start Pipe before parallel phase
             self._inject_llm_keys()
-
-            # Seed shared context with analysis + env vars
-            self._seed_shared_context(code_context)
-
-            # Start Pipe server (Python — raincurve infra, always available)
             self._start_pipe()
 
-            # Step 2: Infrastructure (single agent — Hermes pattern)
-            self.on_log("\n[Step 2] Setting up infrastructure...")
-            infra_result = self._run_infra(code_context)
+            # Phase 1: Code analysis + infrastructure in parallel
+            self.on_log("\n[Phase 1] Analyzing codebase + setting up infrastructure (parallel)...")
+            code_context, infra_result = self._run_phase1_parallel(docs)
+
+            self._persist_code_context(code_context)
+            self._seed_shared_context(code_context)
+
+            # Merge infra results
             if infra_result.success and infra_result.output:
                 self.env_overrides.update(infra_result.output.get("env_vars_for_app", {}))
                 self._infra_services = {
@@ -122,9 +129,9 @@ class SandboxOrchestrator:
                     if s.get("status") in ("running", "pipe", "disabled")
                 }
 
-            # Step 3: Build and run app (LLM agent)
-            self.on_log("\n[Step 3] Building application...")
-            build_result = self._run_build(code_context)
+            # Step 3: Build via Overseer (strategic agent)
+            self.on_log("\n[Step 3] Building application (overseer)...")
+            build_result = self._run_overseer(code_context)
 
             output = build_result.output or {}
             port = output.get("port")
@@ -228,7 +235,7 @@ class SandboxOrchestrator:
 
         for attempt in range(3):
             result = agent.run()
-            self._total_tool_calls += result.tool_call_count
+            self._record_tool_calls(result.tool_call_count)
             if result.success and result.output:
                 try:
                     ctx = CodeContext.model_validate({
@@ -269,7 +276,7 @@ class SandboxOrchestrator:
         if ctx.app_description:
             parts.append(f"Description: {ctx.app_description}")
         if ctx.database:
-            parts.append(f"\n## Database")
+            parts.append("\n## Database")
             parts.append(f"Type: {ctx.database.db_type}")
             if ctx.database.connection_env_var:
                 parts.append(f"Connection env var: {ctx.database.connection_env_var}")
@@ -278,14 +285,14 @@ class SandboxOrchestrator:
             if ctx.database.schema_summary:
                 parts.append(f"Schema: {ctx.database.schema_summary}")
         if ctx.sdk_usages:
-            parts.append(f"\n## Detected services")
+            parts.append("\n## Detected services")
             for sdk in ctx.sdk_usages:
                 parts.append(
                     f"- {sdk.service_name}: package={sdk.sdk_package}, "
                     f"init={sdk.init_file}, files={sdk.files_using_sdk}"
                 )
         if ctx.env_vars:
-            parts.append(f"\n## Environment variables")
+            parts.append("\n## Environment variables")
             for ev in ctx.env_vars:
                 parts.append(f"- {ev.name}: {ev.purpose or '(no description)'}")
         if ctx.start_command:
@@ -313,7 +320,26 @@ class SandboxOrchestrator:
         )
         self.on_log("  Seeded shared context for service agents")
 
-    # (Parallel service agents removed — single InfraAgent handles everything)
+    # ------------------------------------------------------------------
+    # Phase 1: Parallel code analysis + infrastructure
+    # ------------------------------------------------------------------
+
+    def _run_phase1_parallel(
+        self, docs: ProjectDocs,
+    ) -> tuple[CodeContext, AgentResult]:
+        """Run code analysis and infrastructure setup concurrently.
+
+        Infra uses a preliminary summary from repo_brief + detection_result
+        so it doesn't need to wait for the full code analysis.
+        """
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="phase1") as pool:
+            analysis_future = pool.submit(self._run_code_analysis, docs)
+            infra_future = pool.submit(self._run_infra)
+
+            code_context = analysis_future.result()
+            infra_result = infra_future.result()
+
+        return code_context, infra_result
 
     # ------------------------------------------------------------------
     # LLM key injection
@@ -385,26 +411,42 @@ class SandboxOrchestrator:
     # Step 3: Infrastructure + external services
     # ------------------------------------------------------------------
 
-    def _run_infra(self, ctx: CodeContext) -> AgentResult:
-        summary_parts = [
-            f"Language: {ctx.language}",
-            f"Framework: {ctx.framework or 'unknown'}",
-        ]
-        if ctx.database:
-            summary_parts.append(f"Database: {ctx.database.db_type}")
-            if ctx.database.connection_env_var:
-                summary_parts.append(f"Connection env var: {ctx.database.connection_env_var}")
-            if ctx.database.migration_command:
-                summary_parts.append(f"Migration: {ctx.database.migration_command}")
-        for sdk in ctx.sdk_usages:
-            strategy = (sdk.patching_strategy or "").lower()
-            if not sdk.init_file or "false positive" in strategy or "not used" in strategy:
-                summary_parts.append(f"Service {sdk.service_name}: NOT USED (skip)")
-            else:
-                summary_parts.append(
-                    f"Service {sdk.service_name}: init in {sdk.init_file}, "
-                    f"strategy: {sdk.patching_strategy}"
-                )
+    def _run_infra(self, ctx: CodeContext | None = None) -> AgentResult:
+        summary_parts: list[str] = []
+        if ctx:
+            summary_parts = [
+                f"Language: {ctx.language}",
+                f"Framework: {ctx.framework or 'unknown'}",
+            ]
+            if ctx.database:
+                summary_parts.append(f"Database: {ctx.database.db_type}")
+                if ctx.database.connection_env_var:
+                    summary_parts.append(f"Connection env var: {ctx.database.connection_env_var}")
+                if ctx.database.migration_command:
+                    summary_parts.append(f"Migration: {ctx.database.migration_command}")
+            for sdk in ctx.sdk_usages:
+                strategy = (sdk.patching_strategy or "").lower()
+                if not sdk.init_file or "false positive" in strategy or "not used" in strategy:
+                    summary_parts.append(f"Service {sdk.service_name}: NOT USED (skip)")
+                else:
+                    summary_parts.append(
+                        f"Service {sdk.service_name}: init in {sdk.init_file}, "
+                        f"strategy: {sdk.patching_strategy}"
+                    )
+        else:
+            b = self.repo_brief
+            summary_parts = [
+                f"Language: {b.language if b else 'unknown'}",
+                f"Framework: {b.framework if b else 'unknown'}",
+            ]
+            if b and b.database_type:
+                summary_parts.append(f"Database: {b.database_type}")
+                if b.migration_command:
+                    summary_parts.append(f"Migration: {b.migration_command}")
+            if self.detection_result:
+                for svc in self.detection_result.detected_services:
+                    if svc.name not in DISABLEABLE_SERVICES:
+                        summary_parts.append(f"Service {svc.name}: detected in codebase")
 
         recipes_parts = []
         if self.detection_result:
@@ -445,25 +487,60 @@ class SandboxOrchestrator:
             recipes_text="\n".join(recipes_parts) if recipes_parts else "(no recipes)",
             pipe_info=pipe_info,
             disabled_services="\n".join(disabled_parts) if disabled_parts else "(none)",
-            on_log=lambda m: self.on_log(f"  {m}"),
+            on_log=lambda m: self.on_log(f"  [infra] {m}"),
         )
 
         for attempt in range(2):
             result = agent.run()
-            self._total_tool_calls += result.tool_call_count
+            self._record_tool_calls(result.tool_call_count)
             if result.success:
                 self.on_log(
-                    f"  Infrastructure ready ({result.duration_s:.1f}s, "
+                    f"  [infra] Ready ({result.duration_s:.1f}s, "
                     f"{result.tool_call_count} calls)"
                 )
                 return result
-            self.on_log(f"  Infra attempt {attempt + 1}/2 failed: {result.failure_reason}")
+            self.on_log(f"  [infra] Attempt {attempt + 1}/2 failed: {result.failure_reason}")
 
-        self.on_log("  Infrastructure incomplete — continuing anyway")
+        self.on_log("  [infra] Incomplete — continuing anyway")
         return AgentResult(success=True, output={"services": [], "env_vars_for_app": {}})
 
     # ------------------------------------------------------------------
-    # Step 4: Build
+    # Step 3: Overseer (strategic build agent)
+    # ------------------------------------------------------------------
+
+    def _run_overseer(self, ctx: CodeContext) -> AgentResult:
+        infra_services = set()
+        if hasattr(self, '_infra_services'):
+            infra_services = self._infra_services
+
+        overseer = OverseerAgent(
+            project_dir=self.project_dir,
+            project_name=self.project_name,
+            container_name=self.container_name,
+            network_name=self.network_name,
+            env_overrides=self.env_overrides,
+            detection_result=self.detection_result,
+            repo_brief=self.repo_brief,
+            pre_started_services=infra_services,
+            on_log=lambda m: self.on_log(f"  [overseer] {m}"),
+        )
+
+        result = overseer.run()
+        self._record_tool_calls(result.tool_call_count)
+
+        if result.success:
+            self.on_log(
+                f"  Build complete ({result.duration_s:.1f}s, "
+                f"{result.tool_call_count} calls)"
+            )
+            return result
+
+        raise RuntimeError(
+            f"Overseer exhausted all strategies: {result.failure_reason or 'unknown'}"
+        )
+
+    # ------------------------------------------------------------------
+    # Step 3 (legacy): Direct build without overseer
     # ------------------------------------------------------------------
 
     def _run_build(self, ctx: CodeContext) -> AgentResult:
@@ -486,7 +563,7 @@ class SandboxOrchestrator:
             )
 
             result = agent.run()
-            self._total_tool_calls += result.tool_call_count
+            self._record_tool_calls(result.tool_call_count)
 
             if result.success:
                 self.on_log(
@@ -506,7 +583,7 @@ class SandboxOrchestrator:
                     on_log=lambda m: self.on_log(f"  [recovery] {m}"),
                 )
                 fix = recovery.run()
-                self._total_tool_calls += fix.tool_call_count
+                self._record_tool_calls(fix.tool_call_count)
                 if fix.success:
                     self.on_log("  Recovery patch applied, retrying...")
 
@@ -573,7 +650,7 @@ class SandboxOrchestrator:
 
         for attempt in range(2):
             result = seeder.run()
-            self._total_tool_calls += result.tool_call_count
+            self._record_tool_calls(result.tool_call_count)
             if result.success:
                 summary = (result.output or {}).get("summary", "")
                 self.on_log(f"  Seeding complete ({result.duration_s:.1f}s)")
@@ -614,7 +691,7 @@ class SandboxOrchestrator:
         )
 
         result = e2e.run()
-        self._total_tool_calls += result.tool_call_count
+        self._record_tool_calls(result.tool_call_count)
 
         if result.success:
             output = result.output or {}

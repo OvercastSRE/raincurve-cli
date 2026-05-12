@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,6 +8,9 @@ from pathlib import Path
 SKIP_DIRS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
     "dist", "build", ".next", ".raincurve", "vendor",
+    ".turbo", ".vercel", ".output", ".cache", ".docusaurus",
+    "coverage", "storybook-static", ".playwright", ".svelte-kit",
+    ".nuxt", ".parcel-cache", "out", ".expo",
 }
 
 SCAN_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".jsx", ".rb", ".go", ".java", ".rs"}
@@ -483,6 +487,33 @@ IMPORT_PATTERNS: dict[str, list[str]] = {
 }
 
 
+_COMPILED_PATTERNS: dict[str, re.Pattern[str]] = {
+    svc_name: re.compile("|".join(f"(?:{p})" for p in patterns))
+    for svc_name, patterns in IMPORT_PATTERNS.items()
+}
+
+# Fast pre-filter: if none of these strings appear in a file, skip all regex.
+# One keyword per service — plain `in` check is 100x faster than regex.
+_QUICK_KEYWORDS: frozenset[str] = frozenset({
+    "supabase", "stripe", "openai", "anthropic", "boto3", "aws-sdk", "s3",
+    "firebase", "posthog", "sendgrid", "twilio", "googlemaps", "google.maps",
+    "slack", "octokit", "redis", "ioredis", "upstash",
+    "GoogleProvider", "auth0", "clerk", "okta", "cognito", "amplify",
+    "resend", "mailgun", "ses", "postmark",
+    "svix", "pusher", "ably", "discord",
+    "algolia", "instantsearch", "elasticsearch", "pinecone", "weaviate", "qdrant", "meilisearch",
+    "cloudinary", "uploadthing",
+    "sentry", "datadog", "ddtrace",
+    "mongoose", "mongodb", "MongoClient", "neon", "planetscale", "turso", "libsql",
+    "amqplib", "pika", "kafka", "confluent",
+    "paypal", "lemonsqueezy",
+    "mapbox", "mapboxgl",
+    "launchdarkly", "ldclient",
+    "plaid", "PlaidClient",
+    "@vercel/kv", "@vercel/blob",
+})
+
+
 @dataclass
 class DetectionResult:
     detected_services: list[ExternalService] = field(default_factory=list)
@@ -495,7 +526,6 @@ def detect_external_services(project_dir: str | Path) -> DetectionResult:
     result = DetectionResult()
     seen_services: set[str] = set()
 
-    # Scan env files for known env vars
     for env_file in ["env.example", ".env.example", ".env.sample", ".env.template", ".env"]:
         path = project_dir / env_file
         if path.exists():
@@ -509,25 +539,26 @@ def detect_external_services(project_dir: str | Path) -> DetectionResult:
             except (PermissionError, OSError):
                 pass
 
-    # Scan source files for SDK imports
     for src_file in _walk_source_files(project_dir):
         try:
             content = src_file.read_text(encoding="utf-8", errors="replace")
         except (PermissionError, OSError):
             continue
 
-        for svc_name, patterns in IMPORT_PATTERNS.items():
-            for pattern in patterns:
-                if re.search(pattern, content):
-                    if svc_name not in result.import_hits:
-                        result.import_hits[svc_name] = []
-                    rel = str(src_file.relative_to(project_dir))
-                    if rel not in result.import_hits[svc_name]:
-                        result.import_hits[svc_name].append(rel)
-                    seen_services.add(svc_name)
-                    break
+        if not any(kw in content for kw in _QUICK_KEYWORDS):
+            continue
 
-    # Build final service list
+        rel: str | None = None
+        for svc_name, compiled in _COMPILED_PATTERNS.items():
+            if compiled.search(content):
+                if rel is None:
+                    rel = str(src_file.relative_to(project_dir))
+                if svc_name not in result.import_hits:
+                    result.import_hits[svc_name] = []
+                if rel not in result.import_hits[svc_name]:
+                    result.import_hits[svc_name].append(rel)
+                seen_services.add(svc_name)
+
     svc_map = {s.name: s for s in KNOWN_SERVICES}
     for name in seen_services:
         if name in svc_map:
@@ -537,13 +568,9 @@ def detect_external_services(project_dir: str | Path) -> DetectionResult:
 
 
 def _walk_source_files(root: Path):
-    for path in root.rglob("*"):
-        if any(skip in path.parts for skip in SKIP_DIRS):
-            continue
-        if path.suffix not in SCAN_EXTENSIONS:
-            continue
-        try:
-            if path.is_file():
-                yield path
-        except OSError:
-            continue
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fname in filenames:
+            p = Path(dirpath) / fname
+            if p.suffix in SCAN_EXTENSIONS:
+                yield p

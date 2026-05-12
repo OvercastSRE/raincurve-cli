@@ -10,8 +10,8 @@ from typing import Callable
 from raincurve.agents.base_agent import AgentResult, BaseAgent, _exec_bash, _truncate
 from raincurve.utils.repo_scanner import build_repo_context
 
-MAX_TOOL_CALLS = 150
-MAX_WALLCLOCK_S = 1800
+MAX_TOOL_CALLS = 80
+MAX_WALLCLOCK_S = 600
 
 TOOLS = [
     {
@@ -209,243 +209,41 @@ TOOLS = [
 ]
 
 SYSTEM_PROMPT = """\
-You are the build agent. Infrastructure is ALREADY SET UP by a prior agent. \
-Your ONLY job: build the app Docker image, start the app container, and verify \
-it responds.
+You are the build agent. Get the application running in Docker and verify it responds.
 
-## What's already done for you
+## Context
 
-- Docker network `{network_name}` exists
-- Database, cache, and service containers are ALREADY RUNNING (listed in your context)
-- Environment variables for all services are ALREADY PROVIDED (in your context)
-- You do NOT need to start postgres, redis, kafka, or any infrastructure
-- You do NOT need to research or set up mock services
+- Docker network: `{network_name}`
+- App container name: `{container_name}`
+- Container label: `--label rc-aux-of={project_name}`
+- Project directory: `{project_dir}`
+- Use `--restart=unless-stopped` on the app container
+- Include ALL environment variables from the context below in your docker run command
+- If infrastructure (postgres, redis) is already running, do not recreate it
+- If infrastructure is missing and the app needs it, start it yourself
 
-## Your focused mission
+## What you can do
 
-1. Check what's already running: `docker ps --filter "label=rc-aux-of={project_name}"`
-2. Read the Dockerfile (if it exists) or write one
-3. Create `.dockerignore` if missing
-4. Build the Docker image
-5. Start the app container with ALL provided env vars
-6. Wait for startup (at least 120 seconds for migration-heavy apps)
-7. Verify health check passes
-8. Call `done`
+- Build Docker images, write Dockerfiles, pull images
+- Bind-mount source code into containers and run dev servers
+- Start any service container the app needs
+- Modify application code inside containers (this is a sandbox, not production)
+- Run migrations, seed data, install dependencies
+- Use web_search/web_fetch to research setup instructions
 
-## Error recovery (CRITICAL)
+## When you're done
 
-When a Docker build fails:
-1. READ the error output — the last 20 lines contain the cause
-2. DIAGNOSE — is it a missing file, wrong base image, missing dependency?
-3. EDIT the Dockerfile to fix the specific issue
-4. THEN retry the build
+Call `done` with: port, health_path, services list, verification evidence, \
+test_credentials (username, password, login_path), and modifications list.
 
-NEVER retry a build without changing something. If the same Dockerfile fails \
-twice, you MUST edit it before trying again. Changing Docker flags (--no-cache, \
---buildx, etc.) does NOT fix Dockerfile bugs.
+Verify before calling done: health check passes, app logs show no crash loop.
 
-## Code modifications
+## Rules
 
-You have FULL PERMISSION to modify application source code inside the container \
-to make services work locally. This is a sandbox — not production.
-
-All modifications happen inside the container or in the Dockerfile/build. \
-NEVER modify files on the user's host machine directly. \
-Record every modification in your `done` call under `modifications`.
-
-## Container conventions
-
-- Network name: `{network_name}`
-- App container: `{container_name}`
-- Label: `--label rc-aux-of={project_name}`
-- Always set `--restart=unless-stopped`, `--memory`, `--cpus`
-- App container: `--memory=1024m --cpus=1.0`
-- Do NOT start infrastructure containers (postgres, redis, etc.) — they are already running
-
-## .dockerignore (ALWAYS create before building)
-
-If the project does not have a `.dockerignore`, create one before running \
-`docker build`. This saves 50-200MB of build context and speeds up builds:
-
-```
-.git
-node_modules
-.next
-__pycache__
-*.pyc
-.env
-.env.*
-!.env.example
-*.md
-tests/
-test/
-spec/
-.github/
-.vscode/
-.idea/
-docker-compose*.yml
-.raincurve/
-```
-
-## BuildKit and cache mounts (ALWAYS use)
-
-Always use `--progress=plain` for builds. Set DOCKER_BUILDKIT=1 as an env var:
-```
-DOCKER_BUILDKIT=1 docker build --progress=plain -t myapp .
-```
-
-When writing Dockerfiles from scratch, use BuildKit cache mounts to make \
-rebuilds near-instant:
-
-```dockerfile
-# syntax=docker/dockerfile:1
-FROM node:22-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
-COPY . .
-RUN npm run build
-
-FROM node:22-alpine
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=builder /app/.next ./.next
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/package.json ./
-EXPOSE 3000
-CMD ["npm", "start"]
-```
-
-For Python:
-```dockerfile
-# syntax=docker/dockerfile:1
-FROM python:3.12-slim AS builder
-WORKDIR /app
-COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
-COPY . .
-
-FROM python:3.12-slim
-WORKDIR /app
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-COPY . .
-CMD ["python", "-m", "app.main"]
-```
-
-## Image base selection
-
-- Always use exact version tags: `postgres:16-alpine`, NOT `postgres:latest`
-- Default to `-slim` variants for Python (Alpine breaks some C extensions)
-- Default to `-alpine` for Node.js, Go, Rust
-- For Go/Rust with no CGO: use `scratch` or `gcr.io/distroless` as final stage
-
-## Environment variables
-
-- Read `.env.example` or `.env.sample` for required variables
-- For DATABASE_URL, REDIS_URL, etc.: use the Docker network hostname \
-  (e.g., `postgresql://postgres:postgres@{container_name}-postgres:5432/app`)
-- For SECRET_KEY, JWT_SECRET, etc.: generate a random value
-- For external API keys (Stripe, SendGrid, etc.): see the "Wiring external \
-  services" section above — env vars alone are NOT enough for HTTP API SDKs
-
-## Data seeding
-
-- If the project has migration commands (alembic, prisma, knex, rails db:migrate), \
-  run them after the database is healthy
-- If there are seed scripts, run them
-- Record the seed commands in your `done` call
-
-## Test credentials (IMPORTANT)
-
-After the app is running, find the default login credentials by reading the README, \
-seed files, migration files, or source code. Most apps have a default admin user \
-created during migrations.
-
-In your `done` call, ALWAYS provide `test_credentials` with:
-- `username`: the default username or email
-- `password`: the default password
-- `login_path`: the API endpoint for authentication (e.g. /api/auth/login)
-- `login_body_template`: the JSON body for the login request
-
-This is critical — the seeder agent will use these to log in and populate data.
-
-## Shell rules
-
-- NEVER pass long inline scripts as shell arguments — write to a file, then execute
-- Use `text_editor` to create files (Dockerfiles, scripts, configs)
-- Keep individual shell commands under 4000 characters
-- Use portable commands: prefer `curl` over `wget`, `docker exec` over host-native tools
-
-## DESTRUCTIVE COMMANDS — NEVER DO THESE (ENFORCED — these are blocked)
-
-- NEVER run `DROP DATABASE`, `DROP SCHEMA`, or `TRUNCATE` on any database
-- NEVER delete or recreate a database that already has tables
-- If the database looks wrong, let the app's own migration system fix it on startup
-- If you need a fresh database, stop and recreate the Postgres CONTAINER (not the DB)
-- Most apps run migrations automatically on startup — just start the app and wait
-
-## APP STARTUP PATIENCE — CRITICAL
-
-After starting the app container, WAIT AT LEAST 120 SECONDS before deciding the \
-app is broken. Most apps (NestJS, Rails, Django) run database migrations on first \
-startup which takes 60-120+ seconds. During this time you WILL see errors in the \
-logs about missing tables, failed queries, etc. — THIS IS NORMAL.
-
-DO NOT stop, remove, or recreate the app container during the first 120 seconds. \
-Use `powershell -Command "Start-Sleep -Seconds 120"` then check logs and health.
-
-If the app is still failing AFTER 120 seconds, THEN investigate — but DO NOT \
-remove the container. Instead, check logs and fix the root cause (missing env var, \
-wrong database name, etc.) by restarting with corrected env vars.
-
-## ENVIRONMENT VARIABLES — INCLUDE ALL OF THEM
-
-The env vars in the "Environment variables" section below are MANDATORY. You MUST \
-include ALL of them in your docker run command. Do NOT remove, modify, or omit any \
-of them — they are pre-configured by the orchestrator to wire mock services, Pipe, \
-and infrastructure. If you add your own env vars, ADD them alongside these, never \
-replace them.
-
-## PREFER PRE-BUILT IMAGES
-
-If the project has a docker-compose.yml that specifies a pre-built image \
-(e.g., `image: twentycrm/twenty:latest`), PULL that image instead of building \
-from source. Building from source takes 10-30 minutes; pulling takes 30 seconds.
-
-Steps:
-1. Read the docker-compose.yml (already provided in key files)
-2. Find the main app service's image name
-3. `docker pull <image>`
-4. `docker run` with the pulled image and ALL env vars
-
-Only build from source if there is NO pre-built image in the compose file, or \
-the compose file uses `build:` instead of `image:`.
-
-## Before calling done — verification
-
-1. **Health check**: `curl -sf http://localhost:{{port}}/healthz` (or the app's health endpoint)
-2. **Database check**: If the app uses a database, confirm tables exist
-3. **Logs check**: `docker logs {container_name} --tail 20` — no crash loops
-
-Include verification results in your `done` call. If health check passes and \
-the app is not crash-looping, you are done. Do NOT write elaborate test scripts.
-
-## Important
-
-- Do NOT ask the user for help. Figure everything out from the codebase.
-- If a build fails, read the error, fix the issue, and retry.
-- If a service won't start, check `docker logs` for the error.
-- The project directory is: `{project_dir}`
-- You are running commands LOCALLY on the user's machine (not in a VM).
-- You have FULL PERMISSION to modify application source code to make services \
-  work locally. This is a sandbox — not production. Do whatever it takes to get \
-  the app running with all services connected. Record all modifications in your \
-  `done` call.
-- All code modifications should happen either: (a) in the Dockerfile/build process, \
-  or (b) via docker exec into the running container. NEVER modify the user's source \
-  files on the host directly — changes must be inside the container.
+- Never run DROP DATABASE, DROP SCHEMA, or TRUNCATE
+- Never modify files on the host — only inside containers or in build artifacts
+- If a build fails, read the error and fix the cause before retrying
+- Be patient with app startup — migrations can take 60-120 seconds
 
 {repo_context}
 """
@@ -468,6 +266,7 @@ class EnvironmentAgent(BaseAgent):
         pre_started_services: set[str] | None = None,
         pipe_handled_services: set[str] | None = None,
         retry_context: str = "",
+        strategy_directive: str = "",
     ) -> None:
         super().__init__(project_dir, on_log)
         self.project_name = project_name
@@ -479,6 +278,7 @@ class EnvironmentAgent(BaseAgent):
         self.pre_started_services = pre_started_services or set()
         self.pipe_handled_services = pipe_handled_services or set()
         self.retry_context = retry_context
+        self.strategy_directive = strategy_directive
         self._build_failures: dict[str, int] = {}
         self._last_build_error: str = ""
 
@@ -647,6 +447,9 @@ class EnvironmentAgent(BaseAgent):
             network_name=self.network_name,
             repo_context=repo_context,
         )
+
+        if self.strategy_directive:
+            system += self.strategy_directive
 
         if self.repo_brief:
             user_msg = self._build_brief_message()

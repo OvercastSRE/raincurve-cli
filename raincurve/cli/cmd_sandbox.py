@@ -114,13 +114,15 @@ def run_sandbox(skip_trust: bool = False, json_output: bool = False) -> None:
             return
         if json_output:
             return
-        if msg.startswith("[Step"):
+        if msg.startswith("[Step") or msg.startswith("[Phase"):
             console.print()
             rc_print(f"  [bold]{msg}[/bold]")
         elif msg.startswith("  Pipe:") or msg.startswith("  Analysis complete"):
             rc_print(f"  {msg}", style="rc.info")
-        elif msg.startswith("  [analysis]"):
-            rc_print(f"    {msg[12:]}", style="rc.dim")
+        elif msg.startswith("  [analysis]") or msg.startswith("  [infra]"):
+            rc_print(f"    {msg}", style="rc.dim")
+        elif msg.startswith("  [overseer]"):
+            rc_print(f"    {msg}", style="rc.info")
         elif msg.startswith("  [seed]") or msg.startswith("  [e2e]"):
             rc_print(f"    {msg}", style="rc.dim")
         elif msg.startswith("  [recovery]"):
@@ -379,7 +381,6 @@ def run_sandbox(skip_trust: bool = False, json_output: bool = False) -> None:
                 "--network", network_name,
                 f"--label=rc-aux-of={project_name}",
                 "--restart=unless-stopped",
-                "--memory=512m", "--cpus=0.5",
             ] + env_args + port_args + [f"{container_name}:latest"]
 
             run_r = _sp.run(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -150,6 +151,7 @@ class BaseAgent:
     ) -> None:
         self.project_dir = project_dir
         self.on_log = on_log or (lambda s: None)
+        self._abort_event = threading.Event()
         if max_tool_calls is not None:
             self.MAX_TOOL_CALLS = max_tool_calls
         if max_wallclock_s is not None:
@@ -248,6 +250,13 @@ class BaseAgent:
 
         while True:
             elapsed = time.time() - start
+            if self._abort_event.is_set():
+                return AgentResult(
+                    success=False,
+                    failure_reason="Aborted: no progress detected",
+                    duration_s=elapsed,
+                    tool_call_count=tool_call_count,
+                )
             if elapsed > self.MAX_WALLCLOCK_S:
                 return AgentResult(
                     success=False,
@@ -418,6 +427,13 @@ class BaseAgent:
 
         while True:
             elapsed = time.time() - start
+            if self._abort_event.is_set():
+                return AgentResult(
+                    success=False,
+                    failure_reason="Aborted: no progress detected",
+                    duration_s=elapsed,
+                    tool_call_count=tool_call_count,
+                )
             if elapsed > self.MAX_WALLCLOCK_S:
                 return AgentResult(
                     success=False,
