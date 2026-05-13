@@ -211,6 +211,13 @@ TOOLS = [
 SYSTEM_PROMPT = """\
 You are the build agent. Get the application running in Docker and verify it responds.
 
+## CRITICAL: Follow project documentation
+
+The project's README and setup docs are provided below. These contain the \
+authoritative instructions for how to build and run this project. Follow them \
+first — do NOT guess build commands or invent Dockerfiles when the project \
+already documents how to set up.
+
 ## Context
 
 - Docker network: `{network_name}`
@@ -245,6 +252,8 @@ Verify before calling done: health check passes, app logs show no crash loop.
 - If a build fails, read the error and fix the cause before retrying
 - Be patient with app startup — migrations can take 60-120 seconds
 
+{project_docs}
+
 {repo_context}
 """
 
@@ -267,6 +276,7 @@ class EnvironmentAgent(BaseAgent):
         pipe_handled_services: set[str] | None = None,
         retry_context: str = "",
         strategy_directive: str = "",
+        project_docs: object | None = None,
     ) -> None:
         super().__init__(project_dir, on_log)
         self.project_name = project_name
@@ -279,6 +289,7 @@ class EnvironmentAgent(BaseAgent):
         self.pipe_handled_services = pipe_handled_services or set()
         self.retry_context = retry_context
         self.strategy_directive = strategy_directive
+        self.project_docs = project_docs
         self._build_failures: dict[str, int] = {}
         self._last_build_error: str = ""
 
@@ -438,13 +449,32 @@ class EnvironmentAgent(BaseAgent):
 
         return "\n".join(parts)
 
+    def _format_project_docs(self) -> str:
+        if not self.project_docs:
+            return ""
+        parts: list[str] = ["## Project Documentation\n"]
+        for attr, label in [
+            ("readme", "README"),
+            ("claude_md", "CLAUDE.md"),
+            ("contributing", "CONTRIBUTING"),
+            ("cursor_rules", ".cursorrules"),
+        ]:
+            val = getattr(self.project_docs, attr, None)
+            if val:
+                parts.append(f"### {label}\n{val[:6000]}\n")
+        for name, content in (getattr(self.project_docs, "custom_docs", None) or {}).items():
+            parts.append(f"### {name}\n{content[:3000]}\n")
+        return "\n".join(parts) if len(parts) > 1 else ""
+
     def run(self) -> AgentResult:
         repo_context = build_repo_context(self.project_dir)
+        docs_text = self._format_project_docs()
         system = SYSTEM_PROMPT.format(
             project_dir=self.project_dir,
             project_name=self.project_name,
             container_name=self.container_name,
             network_name=self.network_name,
+            project_docs=docs_text,
             repo_context=repo_context,
         )
 

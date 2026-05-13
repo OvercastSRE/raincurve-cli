@@ -3,12 +3,11 @@ from __future__ import annotations
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from raincurve.agents.base_agent import AgentResult, OPENROUTER_BASE_URL, OPENROUTER_DEFAULT_KEY
+from raincurve.agents.base_agent import AgentResult, OPENROUTER_BASE_URL, OPENROUTER_DEFAULT_KEY, _exec_bash
 from raincurve.agents.code_analysis_agent import CodeAnalysisAgent
 from raincurve.agents.environment_agent import EnvironmentAgent
 from raincurve.agents.infra_agent import InfraAgent
@@ -26,7 +25,6 @@ from raincurve.models.code_context import (
 )
 from raincurve.pipe.server import PipeServer
 from raincurve.services.recipes import build_docker_run_cmd, get_recipe, DISABLEABLE_SERVICES
-from raincurve.stubs.detector import DetectionResult
 
 
 @dataclass
@@ -73,7 +71,6 @@ class SandboxOrchestrator:
         container_name: str,
         network_name: str,
         env_overrides: dict[str, str],
-        detection_result: DetectionResult,
         repo_brief: Any,
         on_log: Callable[[str], None],
     ) -> None:
@@ -82,7 +79,6 @@ class SandboxOrchestrator:
         self.container_name = container_name
         self.network_name = network_name
         self.env_overrides = dict(env_overrides)
-        self.detection_result = detection_result
         self.repo_brief = repo_brief
         self.on_log = on_log
         self.pipe_server: PipeServer | None = None
@@ -106,46 +102,45 @@ class SandboxOrchestrator:
         start = time.time()
 
         try:
-            # Step 0: Read project docs (Python, zero LLM)
+            # Step 0: Read docs + inject keys (instant, Python)
             self.on_log("[Step 0] Reading project documentation...")
-            docs = self._read_project_docs()
-
-            # Pre-work (instant): inject LLM keys and start Pipe before parallel phase
+            self.docs = self._read_project_docs()
             self._inject_llm_keys()
-            self._start_pipe()
 
-            # Phase 1: Code analysis + infrastructure in parallel
-            self.on_log("\n[Phase 1] Analyzing codebase + setting up infrastructure (parallel)...")
-            code_context, infra_result = self._run_phase1_parallel(docs)
+            # Step 1: Essential infra (deterministic, no LLM — just postgres/redis)
+            self.on_log("\n[Step 1] Starting essential infrastructure...")
+            self._start_essential_infra()
 
-            self._persist_code_context(code_context)
-            self._seed_shared_context(code_context)
-
-            # Merge infra results
-            if infra_result.success and infra_result.output:
-                self.env_overrides.update(infra_result.output.get("env_vars_for_app", {}))
-                self._infra_services = {
-                    s.get("name", "") for s in infra_result.output.get("services", [])
-                    if s.get("status") in ("running", "pipe", "disabled")
-                }
-
-            # Step 3: Build via Overseer (strategic agent)
-            self.on_log("\n[Step 3] Building application (overseer)...")
+            # Step 2: Build the application (this is the priority)
+            self.on_log("\n[Step 2] Building application...")
+            code_context = self._build_fallback_code_context(self.docs)
             build_result = self._run_overseer(code_context)
 
             output = build_result.output or {}
             port = output.get("port")
 
-            # Step 4: Seed data (LLM agent)
+            # Step 3: Deep code analysis (LLM — now that app is up, enrich context)
+            self.on_log("\n[Step 3] Analyzing codebase...")
+            code_context = self._run_code_analysis(self.docs)
+            self._persist_code_context(code_context)
+            self._seed_shared_context(code_context)
+
+            # Step 4: Seed data
             seed_summary: dict = {}
             if port:
                 self.on_log("\n[Step 4] Seeding data...")
                 seed_summary = self._run_seeding(code_context, output)
 
-            # Step 5: E2E smoke test (LLM agent)
+            # Step 5: External services (Pipe + Stripe/email/etc.)
+            if port:
+                self.on_log("\n[Step 5] Setting up external services...")
+                self._start_pipe()
+                self._run_external_services(code_context)
+
+            # Step 6: E2E smoke tests
             e2e_summary: dict = {}
             if port:
-                self.on_log("\n[Step 5] Running E2E smoke tests...")
+                self.on_log("\n[Step 6] Running E2E smoke tests...")
                 e2e_summary = self._run_e2e(code_context, output)
 
             return SandboxResult(
@@ -228,7 +223,6 @@ class SandboxOrchestrator:
             project_dir=self.project_dir,
             project_name=self.project_name,
             repo_brief=self.repo_brief,
-            detection_result=self.detection_result,
             project_docs=docs,
             on_log=lambda m: self.on_log(f"  [analysis] {m[:200]}"),
         )
@@ -321,25 +315,83 @@ class SandboxOrchestrator:
         self.on_log("  Seeded shared context for service agents")
 
     # ------------------------------------------------------------------
-    # Phase 1: Parallel code analysis + infrastructure
+    # Step 2: Essential infra (deterministic, no LLM)
     # ------------------------------------------------------------------
 
-    def _run_phase1_parallel(
-        self, docs: ProjectDocs,
-    ) -> tuple[CodeContext, AgentResult]:
-        """Run code analysis and infrastructure setup concurrently.
+    ESSENTIAL_SERVICES = {"postgres", "postgresql", "mysql", "redis", "mongodb"}
 
-        Infra uses a preliminary summary from repo_brief + detection_result
-        so it doesn't need to wait for the full code analysis.
+    def _start_essential_infra(self) -> None:
+        """Start databases and caches using pre-baked recipes. No LLM needed.
+
+        Only starts services that the project actually uses (detected via
+        repo_brief or detection_result). Skips anything already running.
         """
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="phase1") as pool:
-            analysis_future = pool.submit(self._run_code_analysis, docs)
-            infra_future = pool.submit(self._run_infra)
+        needed: set[str] = set()
 
-            code_context = analysis_future.result()
-            infra_result = infra_future.result()
+        b = self.repo_brief
+        if b and b.database_type:
+            canonical = b.database_type.lower().replace("postgresql", "postgres")
+            needed.add(canonical)
 
-        return code_context, infra_result
+        if not needed:
+            self.on_log("  No essential infrastructure detected")
+            return
+
+        self._infra_services: set[str] = set()
+
+        for svc_name in sorted(needed):
+            container = f"{self.container_name}-{svc_name}"
+
+            check = _exec_bash(
+                f'docker ps --filter "name=^{container}$" --format "{{{{.Status}}}}"',
+                self.project_dir, 5,
+            )
+            if check.ok and check.stdout.strip() and "Up" in check.stdout:
+                self.on_log(f"  {svc_name}: already running ({container})")
+                self._infra_services.add(svc_name)
+                recipe = get_recipe(svc_name)
+                if recipe and recipe.env_wiring:
+                    for k, v in recipe.env_wiring.items():
+                        self.env_overrides.setdefault(k, v.replace("{name}", container))
+                continue
+
+            recipe = get_recipe(svc_name)
+            if not recipe:
+                self.on_log(f"  {svc_name}: no recipe available, skipping")
+                continue
+
+            cmd = build_docker_run_cmd(recipe, container, self.network_name, self.project_name)
+            self.on_log(f"  {svc_name}: starting ({recipe.image})...")
+
+            # Remove any stopped container with same name first
+            _exec_bash(f"docker rm -f {container} 2>/dev/null", self.project_dir, 10)
+
+            result = _exec_bash(cmd, self.project_dir, 60)
+            if not result.ok:
+                self.on_log(f"  {svc_name}: FAILED to start — {result.stderr[:200]}")
+                continue
+
+            # Wait for health check (up to 30s)
+            import time as _time
+            healthy = False
+            for _ in range(15):
+                _time.sleep(2)
+                hc = _exec_bash(
+                    f"docker exec {container} {recipe.healthcheck}",
+                    self.project_dir, 10,
+                )
+                if hc.ok:
+                    healthy = True
+                    break
+
+            if healthy:
+                self.on_log(f"  {svc_name}: healthy ✓")
+                self._infra_services.add(svc_name)
+                if recipe.env_wiring:
+                    for k, v in recipe.env_wiring.items():
+                        self.env_overrides.setdefault(k, v.replace("{name}", container))
+            else:
+                self.on_log(f"  {svc_name}: started but health check failed")
 
     # ------------------------------------------------------------------
     # LLM key injection
@@ -408,60 +460,49 @@ class SandboxOrchestrator:
         self.on_log(f"  Pipe server listening on port {self.pipe_server.port}")
 
     # ------------------------------------------------------------------
-    # Step 3: Infrastructure + external services
+    # Step 5: External services (post-build, LLM agent)
     # ------------------------------------------------------------------
 
-    def _run_infra(self, ctx: CodeContext | None = None) -> AgentResult:
-        summary_parts: list[str] = []
-        if ctx:
-            summary_parts = [
-                f"Language: {ctx.language}",
-                f"Framework: {ctx.framework or 'unknown'}",
-            ]
-            if ctx.database:
-                summary_parts.append(f"Database: {ctx.database.db_type}")
-                if ctx.database.connection_env_var:
-                    summary_parts.append(f"Connection env var: {ctx.database.connection_env_var}")
-                if ctx.database.migration_command:
-                    summary_parts.append(f"Migration: {ctx.database.migration_command}")
-            for sdk in ctx.sdk_usages:
-                strategy = (sdk.patching_strategy or "").lower()
-                if not sdk.init_file or "false positive" in strategy or "not used" in strategy:
-                    summary_parts.append(f"Service {sdk.service_name}: NOT USED (skip)")
-                else:
-                    summary_parts.append(
-                        f"Service {sdk.service_name}: init in {sdk.init_file}, "
-                        f"strategy: {sdk.patching_strategy}"
-                    )
-        else:
-            b = self.repo_brief
-            summary_parts = [
-                f"Language: {b.language if b else 'unknown'}",
-                f"Framework: {b.framework if b else 'unknown'}",
-            ]
-            if b and b.database_type:
-                summary_parts.append(f"Database: {b.database_type}")
-                if b.migration_command:
-                    summary_parts.append(f"Migration: {b.migration_command}")
-            if self.detection_result:
-                for svc in self.detection_result.detected_services:
-                    if svc.name not in DISABLEABLE_SERVICES:
-                        summary_parts.append(f"Service {svc.name}: detected in codebase")
+    def _run_external_services(self, ctx: CodeContext) -> None:
+        """Set up non-essential external services AFTER the app is running.
+
+        Essential infra (databases, caches) was already started deterministically
+        in Step 2. This handles: HTTP API mocks (Stripe, Twilio), email services,
+        search engines, etc.
+        """
+        already_handled = getattr(self, "_infra_services", set()) | DISABLEABLE_SERVICES
+        remaining = []
+
+        if not remaining:
+            self.on_log("  No external services to set up")
+            return
+
+        self.on_log(f"  External services needed: {', '.join(s.name for s in remaining)}")
+
+        summary_parts = [
+            f"Language: {ctx.language}",
+            f"Framework: {ctx.framework or 'unknown'}",
+        ]
+        for sdk in ctx.sdk_usages:
+            strategy = (sdk.patching_strategy or "").lower()
+            if not sdk.init_file or "false positive" in strategy or "not used" in strategy:
+                summary_parts.append(f"Service {sdk.service_name}: NOT USED (skip)")
+            else:
+                summary_parts.append(
+                    f"Service {sdk.service_name}: init in {sdk.init_file}, "
+                    f"strategy: {sdk.patching_strategy}"
+                )
 
         recipes_parts = []
-        if self.detection_result:
-            for svc in self.detection_result.detected_services:
-                if svc.name in DISABLEABLE_SERVICES:
-                    continue
-                recipe = get_recipe(svc.name)
-                if recipe:
-                    cmd = build_docker_run_cmd(
-                        recipe, self.container_name, self.network_name, self.project_name,
-                    )
-                    recipes_parts.append(f"\n**{svc.name}**:\n```\n{cmd}\n```")
-                    if recipe.env_wiring:
-                        wiring = ", ".join(f"{k}={v}" for k, v in recipe.env_wiring.items())
-                        recipes_parts.append(f"App env vars: {wiring}")
+        for svc in remaining:
+            recipe = get_recipe(svc.name)
+            if recipe:
+                container = f"{self.container_name}-{svc.name}"
+                cmd = build_docker_run_cmd(recipe, container, self.network_name, self.project_name)
+                recipes_parts.append(f"\n**{svc.name}**:\n```\n{cmd}\n```")
+                if recipe.env_wiring:
+                    wiring = ", ".join(f"{k}={v}" for k, v in recipe.env_wiring.items())
+                    recipes_parts.append(f"App env vars: {wiring}")
 
         pipe_port = self.pipe_server.port if self.pipe_server else 19877
         pipe_info = (
@@ -473,10 +514,6 @@ class SandboxOrchestrator:
         )
 
         disabled_parts = []
-        if self.detection_result:
-            for svc in self.detection_result.detected_services:
-                if svc.name in DISABLEABLE_SERVICES:
-                    disabled_parts.append(f"- {svc.name} (disable via env var)")
 
         agent = InfraAgent(
             project_dir=self.project_dir,
@@ -487,22 +524,24 @@ class SandboxOrchestrator:
             recipes_text="\n".join(recipes_parts) if recipes_parts else "(no recipes)",
             pipe_info=pipe_info,
             disabled_services="\n".join(disabled_parts) if disabled_parts else "(none)",
-            on_log=lambda m: self.on_log(f"  [infra] {m}"),
+            project_docs=getattr(self, "docs", None),
+            on_log=lambda m: self.on_log(f"  [services] {m}"),
         )
 
-        for attempt in range(2):
-            result = agent.run()
-            self._record_tool_calls(result.tool_call_count)
-            if result.success:
-                self.on_log(
-                    f"  [infra] Ready ({result.duration_s:.1f}s, "
-                    f"{result.tool_call_count} calls)"
-                )
-                return result
-            self.on_log(f"  [infra] Attempt {attempt + 1}/2 failed: {result.failure_reason}")
+        result = agent.run()
+        self._record_tool_calls(result.tool_call_count)
 
-        self.on_log("  [infra] Incomplete — continuing anyway")
-        return AgentResult(success=True, output={"services": [], "env_vars_for_app": {}})
+        if result.success and result.output:
+            self.env_overrides.update(result.output.get("env_vars_for_app", {}))
+            for s in result.output.get("services", []):
+                if s.get("status") in ("running", "pipe", "disabled"):
+                    self._infra_services.add(s.get("name", ""))
+            self.on_log(
+                f"  [services] Done ({result.duration_s:.1f}s, "
+                f"{result.tool_call_count} calls)"
+            )
+        else:
+            self.on_log(f"  [services] Incomplete: {result.failure_reason} — continuing")
 
     # ------------------------------------------------------------------
     # Step 3: Overseer (strategic build agent)
@@ -519,9 +558,9 @@ class SandboxOrchestrator:
             container_name=self.container_name,
             network_name=self.network_name,
             env_overrides=self.env_overrides,
-            detection_result=self.detection_result,
             repo_brief=self.repo_brief,
             pre_started_services=infra_services,
+            project_docs=self.docs,
             on_log=lambda m: self.on_log(f"  [overseer] {m}"),
         )
 
@@ -555,11 +594,11 @@ class SandboxOrchestrator:
                 container_name=self.container_name,
                 network_name=self.network_name,
                 env_overrides=self.env_overrides,
-                detection_result=self.detection_result,
                 repo_brief=self.repo_brief,
                 on_log=lambda m: self.on_log(f"  {m}"),
                 pre_started_services=infra_services,
                 pipe_handled_services=set(),
+                project_docs=self.docs,
             )
 
             result = agent.run()
@@ -730,15 +769,6 @@ class SandboxOrchestrator:
 
     def _build_fallback_code_context(self, docs: ProjectDocs) -> CodeContext:
         sdk_usages = []
-        if self.detection_result:
-            for svc_name, files in self.detection_result.import_hits.items():
-                sdk_usages.append(SDKUsage(
-                    service_name=svc_name,
-                    sdk_package=svc_name,
-                    init_file=files[0] if files else "",
-                    files_using_sdk=files,
-                    patching_strategy="Try env var override first, then patch code",
-                ))
 
         b = self.repo_brief
         db = None

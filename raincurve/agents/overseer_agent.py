@@ -115,6 +115,13 @@ SYSTEM_PROMPT = """\
 You are the Build Overseer — a strategic agent that decides HOW to bring up \
 an application as a running Docker sandbox.
 
+## CRITICAL: Read project documentation FIRST
+
+Before choosing any strategy, read the project README and other documentation \
+provided below. The README almost always contains setup instructions, build \
+commands, Docker instructions, and environment requirements. Your strategy \
+should follow the project's own documentation — not guess from file names.
+
 ## Your role
 
 You do NOT build the app yourself. You choose a strategy, write a clear \
@@ -144,13 +151,14 @@ Best for: projects with well-configured docker-compose.yml that includes all ser
 
 ## Decision framework
 
+- **README says how to run with Docker** → follow the README instructions exactly
+- Past learnings (if provided) override defaults below
+- Has docker-compose with all services defined → **try compose_up first**
+- Has Dockerfile → **try dockerfile_build first**
 - No Dockerfile + standard framework (Next.js, SvelteKit, Nuxt, Remix, Django, \
 FastAPI, Rails, Express) → **try bind_mount_dev first**
-- Has Dockerfile → **try dockerfile_build first**
 - Has docker-compose with `image:` (pre-built) → **try pull_image first**
-- Has docker-compose with `build:` → **try compose_up or dockerfile_build**
 - Unsure / exotic stack → **try nixpacks**
-- IMPORTANT: Past learnings (if provided) override these defaults
 
 ## Key principles
 
@@ -186,9 +194,9 @@ class OverseerAgent(BaseAgent):
         container_name: str,
         network_name: str,
         env_overrides: dict[str, str],
-        detection_result: object,
         repo_brief: object,
         pre_started_services: set[str],
+        project_docs: object | None = None,
         on_log: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(project_dir, on_log)
@@ -196,9 +204,9 @@ class OverseerAgent(BaseAgent):
         self.container_name = container_name
         self.network_name = network_name
         self.env_overrides = env_overrides
-        self.detection_result = detection_result
         self.repo_brief = repo_brief
         self.pre_started_services = pre_started_services
+        self.project_docs = project_docs
         self._build_attempts: list[dict] = []
         self._last_build_result: AgentResult | None = None
         self._proc_mem = ProceduralMemory()
@@ -233,6 +241,16 @@ class OverseerAgent(BaseAgent):
     def _build_initial_message(self) -> str:
         b = self.repo_brief
         parts = [f"Bring up the application at: {self.project_dir}\n"]
+
+        # Project documentation FIRST — this is the most important context
+        docs_content = self._format_project_docs()
+        if docs_content:
+            parts.append("## Project Documentation (READ THIS FIRST)\n")
+            parts.append(
+                "This is the project's own documentation. Follow these setup "
+                "instructions when choosing your strategy and writing directives.\n"
+            )
+            parts.append(docs_content)
 
         if b:
             parts.append("## Project analysis\n")
@@ -284,6 +302,24 @@ class OverseerAgent(BaseAgent):
         )
         return "\n".join(parts)
 
+    def _format_project_docs(self) -> str:
+        if not self.project_docs:
+            return ""
+        parts: list[str] = []
+        for attr, label in [
+            ("readme", "README"),
+            ("claude_md", "CLAUDE.md"),
+            ("contributing", "CONTRIBUTING"),
+            ("cursor_rules", ".cursorrules"),
+            ("agents_md", "AGENTS.md"),
+        ]:
+            val = getattr(self.project_docs, attr, None)
+            if val:
+                parts.append(f"### {label}\n{val[:6000]}\n")
+        for name, content in (getattr(self.project_docs, "custom_docs", None) or {}).items():
+            parts.append(f"### {name}\n{content[:3000]}\n")
+        return "\n".join(parts)
+
     def _handle_tool(self, name: str, args: dict) -> Any:
         if name == "execute_build":
             return self._tool_execute_build(args)
@@ -325,12 +361,12 @@ class OverseerAgent(BaseAgent):
             container_name=self.container_name,
             network_name=self.network_name,
             env_overrides=self.env_overrides,
-            detection_result=self.detection_result,
             repo_brief=self.repo_brief,
             on_log=tracking_log,
             pre_started_services=self.pre_started_services,
             pipe_handled_services=set(),
             strategy_directive=strategy_prompt,
+            project_docs=self.project_docs,
         )
 
         result_holder: list[AgentResult | None] = [None]

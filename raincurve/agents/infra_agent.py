@@ -153,6 +153,15 @@ HTTP API services.
 You are NOT building the app. You are NOT running the app. You are setting up \
 infrastructure and providing env vars for the build agent.
 
+## CRITICAL: Read project documentation FIRST
+
+The project's README and setup docs are provided below. They describe what \
+infrastructure this project needs — databases, services, environment variables, \
+and how to configure them. Read this BEFORE scanning .env files or running \
+commands. The README is the authoritative source for what the project requires.
+
+{project_docs}
+
 ## Code Analysis Results
 
 {code_context_summary}
@@ -178,16 +187,17 @@ infrastructure and providing env vars for the build agent.
 
 ## Your Approach
 
-1. Read .env / .env.example to get correct database names, credentials, URLs
-2. Check what's already running: `docker ps --filter "label=rc-aux-of={project_name}"`
+1. Read the project documentation above to understand what infrastructure is needed
+2. Read .env / .env.example to get correct database names, credentials, URLs
+3. Check what's already running: `docker ps --filter "label=rc-aux-of={project_name}"`
    - If a service is already running and healthy, collect its env vars and move on
-3. Set up services in dependency order: databases → caches → brokers → HTTP APIs
-4. For each service:
+4. Set up services in dependency order: databases → caches → brokers → HTTP APIs
+5. For each service:
    a. If already running and healthy → collect env vars, skip
    b. If needs a container → start it, wait for health check, collect env vars
    c. If it's an HTTP API (Stripe, Twilio, SendGrid) → wire to Pipe, no container
    d. If it's analytics/monitoring → disable via env var
-5. Call done with ALL services and ALL env vars
+6. Call done with ALL services and ALL env vars
 
 ## delegate_task (optional)
 
@@ -199,7 +209,6 @@ Do complex or research-heavy services yourself.
 ## Rules
 
 - NEVER run DROP DATABASE, DROP SCHEMA, or TRUNCATE
-- Read .env files FIRST — they have the correct config
 - If a service fails after 2 attempts, skip it and note it
 - Verify each service with ONE health check (pg_isready, redis-cli ping, etc.)
 - Do NOT write elaborate multi-line test scripts — a simple health check is enough
@@ -222,6 +231,7 @@ class InfraAgent(BaseAgent):
         recipes_text: str,
         pipe_info: str,
         disabled_services: str,
+        project_docs: object | None = None,
         on_log: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(project_dir, on_log)
@@ -232,7 +242,22 @@ class InfraAgent(BaseAgent):
         self.recipes_text = recipes_text
         self.pipe_info = pipe_info
         self.disabled_services = disabled_services
+        self.project_docs = project_docs
         self._delegated_env_vars: dict[str, str] = {}
+
+    def _format_project_docs(self) -> str:
+        if not self.project_docs:
+            return "(no project documentation found)"
+        parts: list[str] = []
+        for attr, label in [
+            ("readme", "README"),
+            ("claude_md", "CLAUDE.md"),
+            ("contributing", "CONTRIBUTING"),
+        ]:
+            val = getattr(self.project_docs, attr, None)
+            if val:
+                parts.append(f"### {label}\n{val[:6000]}\n")
+        return "\n".join(parts) if parts else "(no project documentation found)"
 
     def run(self) -> AgentResult:
         system = SYSTEM_PROMPT.format(
@@ -243,6 +268,7 @@ class InfraAgent(BaseAgent):
             recipes=self.recipes_text,
             pipe_info=self.pipe_info,
             disabled_services=self.disabled_services or "(none)",
+            project_docs=self._format_project_docs(),
         )
 
         user_msg = (

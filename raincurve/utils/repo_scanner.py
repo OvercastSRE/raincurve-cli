@@ -10,6 +10,9 @@ SKIP_DIRS = {
 }
 
 KEY_FILES = [
+    "README.md",
+    "readme.md",
+    "Readme.md",
     "Dockerfile",
     "docker-compose.yml",
     "docker-compose.yaml",

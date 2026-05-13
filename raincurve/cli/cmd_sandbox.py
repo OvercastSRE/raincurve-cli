@@ -15,7 +15,6 @@ from raincurve.config.schemas import ProjectConfig
 from raincurve.docker.network import ensure_network
 from raincurve.models.run_state import ContainerStatus, RunState
 from raincurve.orchestrator import SandboxOrchestrator
-from raincurve.stubs.detector import detect_external_services
 from raincurve.utils.repo_analyzer import analyze_repo
 from raincurve.ui.confirm import trust_check
 from raincurve.ui.console import console, rc_error, rc_print, rc_success, rc_warn
@@ -94,15 +93,6 @@ def run_sandbox(skip_trust: bool = False, json_output: bool = False) -> None:
     if repo_brief.database_type:
         rc_print(f"  Database: {repo_brief.database_type}")
 
-    # Detect external services
-    rc_print("  Scanning for external dependencies...")
-    detection = detect_external_services(project_dir)
-    if detection.detected_services:
-        svc_names = [s.name for s in detection.detected_services]
-        rc_print(f"  Detected: {', '.join(svc_names)}")
-    else:
-        rc_print("  No external dependencies detected", style="rc.dim")
-
     console.print()
 
     # ------------------------------------------------------------------
@@ -146,7 +136,6 @@ def run_sandbox(skip_trust: bool = False, json_output: bool = False) -> None:
         container_name=container_name,
         network_name=network_name,
         env_overrides=env_overrides,
-        detection_result=detection,
         repo_brief=repo_brief,
         on_log=on_log,
     )
